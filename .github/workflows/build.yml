@@ -57,6 +57,33 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/
           cp README.md LICENSE dist/
+      - name: macOS app bundle
+        if: runner.os == 'macOS'
+        run: |
+          APP="dist/Rockchip SD Tool.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp target/${{ matrix.target }}/release/rockchip_sd_tool "$APP/Contents/MacOS/"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Rockchip SD Tool</string>
+            <key>CFBundleDisplayName</key><string>Rockchip SD Tool</string>
+            <key>CFBundleIdentifier</key><string>com.thegammasqueeze.rockchip-sd-tool</string>
+            <key>CFBundleVersion</key><string>1.0.0</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleExecutable</key><string>rockchip_sd_tool</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSHumanReadableCopyright</key><string>MIT License</string>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$APP"
+          # ditto keeps the bundle permissions and structure intact inside the zip.
+          (cd dist && ditto -c -k --keepParent "Rockchip SD Tool.app" "Rockchip_SD_Tool.app.zip" && rm -rf "Rockchip SD Tool.app")
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}

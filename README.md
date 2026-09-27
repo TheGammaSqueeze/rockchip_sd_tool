@@ -29,7 +29,10 @@ cargo build --release
 ```
 
 The binary is `target/release/rockchip_sd_tool` (`rockchip_sd_tool.exe` on Windows).
-It is a single self-contained executable.
+It is a single self-contained executable. The macOS release zips also contain
+`Rockchip SD Tool.app`, a double-clickable bundle around the same binary; since it is
+not notarized, the first launch needs a right-click, Open (or `xattr -dr
+com.apple.quarantine "Rockchip SD Tool.app"`).
 
 Linux build dependencies (Debian/Ubuntu): `sudo apt install build-essential libxkbcommon-dev libwayland-dev libgl1-mesa-dev`.
 Windows: Visual Studio Build Tools (C++), which rustup installs on request.
