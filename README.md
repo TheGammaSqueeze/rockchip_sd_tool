@@ -115,7 +115,9 @@ Details that matter for a byte-identical result:
   GUIDs are random version 4 UUIDs (a `uuid:name=...` parameter line overrides the
   unique GUID); `:bootable` sets attribute bit 2; the backup header's entry LBA is
   `total - 33`. Note: the RG DS Plus firmware rewrites the header's last usable LBA to
-  `total - 34` on first boot, so a card read back from a device differs there.
+  `total - 34` on first boot, and Windows does the same as soon as the disk is released
+  after writing, so a card read back later differs in the header (not the entries).
+  The tool therefore verifies through its own locked handle before releasing the disk.
 * Items over 4 GiB use afptool's extension (high 32 bits of offset and size stored
   behind an `H` marker inside the file name field), which is honoured.
 

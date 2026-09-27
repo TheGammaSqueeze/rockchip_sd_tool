@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::plan;
 use crate::rkfw::RkfwImage;
@@ -49,12 +49,11 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
                 bail!("the compressed image decodes to {} bytes, expected {}", reader.size(), total_sectors * 512);
             }
             writer::verify_target(&ops, &img, reader.as_mut(), progress, cancel)?;
-        } else if is_dev {
-            drop(target);
-            let mut dev = crate::blockdev::BlockDevice::open_for_read(&spec.output)
-                .context("cannot reopen the device for verification")?;
-            writer::verify_target(&ops, &img, &mut dev, progress, cancel)?;
         } else {
+            // Verify through the same handle while the disk is still locked. Reads bypass the
+            // cache on every platform, and releasing the disk first would let the host rewrite
+            // the GPT header (Windows repairs a header whose last usable LBA is not total - 34,
+            // as the Rockchip device itself does on first boot) before the check runs.
             writer::verify_target(&ops, &img, target.as_mut(), progress, cancel)?;
         }
     }
