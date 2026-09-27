@@ -1,0 +1,58 @@
+[package]
+name = "rockchip_sd_tool"
+version = "1.0.0"
+edition = "2021"
+description = "Cross-platform SD card creator for Rockchip RKFW firmware images (SD boot cards)"
+license = "MIT"
+repository = "https://github.com/TheGammaSqueeze/rockchip_sd_tool"
+default-run = "rockchip_sd_tool"
+
+[[bin]]
+name = "rockchip_sd_tool"
+path = "src/main.rs"
+
+[lib]
+name = "rockchip_sd_tool"
+path = "src/lib.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+egui-file-dialog = "0.15"
+liblzma = { version = "0.4", features = ["static", "parallel"] }
+crc32fast = "1"
+rand = "0.10"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
+[build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

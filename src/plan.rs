@@ -1,0 +1,332 @@
+//! Turns an RKFW image plus a card size into the exact list of writes SDDiskTool performs in its
+//! "SD Boot" mode, in the same order:
+//!
+//! 1. clear the first two sectors (MBR and primary GPT header);
+//! 2. the loader (`FlashHead`, `FlashData`, `FlashBoot`) at sector 64, 68 and 68 + data sectors;
+//! 3. every firmware item that has a partition address, in table order, at its partition offset,
+//!    Android sparse images expanded (zeros first, then the chunks);
+//! 4. the primary and backup GPT.
+//!
+//! The plan is a list of sector-granular operations. Random-access targets execute it in this
+//! order; streaming targets get it flattened into ascending, non-overlapping ranges first.
+
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Result};
+
+use crate::gpt;
+use crate::rkfw::RkfwImage;
+use crate::sparse::{self, Chunk, SparseHeader};
+
+pub const SECTOR: u64 = 512;
+/// Where the loader goes (SDDiskTool `IDBLOCK_POS`, default 64).
+pub const IDBLOCK_POS: u64 = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Zeros.
+    Zero,
+    /// Bytes from the image file at this offset; shorter than the op length means zero padding.
+    File { offset: u64, len: u64 },
+    /// A repeated 4-byte pattern.
+    Fill([u8; 4]),
+    /// Literal bytes (loader, GPT).
+    Bytes(std::sync::Arc<Vec<u8>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Op {
+    /// Name of the step this op belongs to (shown as progress).
+    pub step: String,
+    pub sector: u64,
+    pub sectors: u64,
+    pub source: Source,
+}
+
+impl Op {
+    pub fn bytes(&self) -> u64 {
+        self.sectors * SECTOR
+    }
+    pub fn end_sector(&self) -> u64 {
+        self.sector + self.sectors
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub total_sectors: u64,
+    pub ops: Vec<Op>,
+    pub gpt: gpt::GptImage,
+    /// Human readable summary lines.
+    pub notes: Vec<String>,
+}
+
+impl Plan {
+    pub fn total_bytes(&self) -> u64 {
+        self.ops.iter().map(|o| o.bytes()).sum()
+    }
+
+    /// Flattens the plan into ascending, non-overlapping ops where later writes win, exactly the
+    /// final content of the card. Zero ops are kept (the caller decides whether to skip them).
+    pub fn flattened(&self) -> Vec<Op> {
+        // Interval map keyed by start sector: start -> (end, index of op, offset into op).
+        let mut map: BTreeMap<u64, (u64, usize, u64)> = BTreeMap::new();
+        for (idx, op) in self.ops.iter().enumerate() {
+            if op.sectors == 0 {
+                continue;
+            }
+            let (s, e) = (op.sector, op.end_sector());
+            // Split or remove everything that overlaps [s, e).
+            let overlapping: Vec<u64> = map.range(..e).filter(|(_, (oe, _, _))| *oe > s).map(|(k, _)| *k).collect();
+            for k in overlapping {
+                let (oe, oi, ooff) = map.remove(&k).unwrap();
+                if k < s {
+                    map.insert(k, (s, oi, ooff));
+                }
+                if oe > e {
+                    map.insert(e, (oe, oi, ooff + (e - k)));
+                }
+            }
+            map.insert(s, (e, idx, 0));
+        }
+        let mut out = Vec::with_capacity(map.len());
+        for (s, (e, idx, off)) in map {
+            let op = &self.ops[idx];
+            let sectors = e - s;
+            let source = match &op.source {
+                Source::Zero => Source::Zero,
+                Source::Fill(p) => Source::Fill(*p),
+                Source::File { offset, len } => {
+                    let skip = off * SECTOR;
+                    if skip >= *len {
+                        Source::Zero
+                    } else {
+                        let l = std::cmp::min(len - skip, sectors * SECTOR);
+                        Source::File { offset: offset + skip, len: l }
+                    }
+                }
+                Source::Bytes(b) => {
+                    let skip = (off * SECTOR) as usize;
+                    let take = std::cmp::min(b.len().saturating_sub(skip), (sectors * SECTOR) as usize);
+                    if take == 0 {
+                        Source::Zero
+                    } else {
+                        Source::Bytes(std::sync::Arc::new(b[skip..skip + take].to_vec()))
+                    }
+                }
+            };
+            out.push(Op { step: op.step.clone(), sector: s, sectors, source });
+        }
+        out
+    }
+}
+
+fn sectors_for(bytes: u64) -> u64 {
+    (bytes + SECTOR - 1) / SECTOR
+}
+
+/// Builds the plan for `img` on a card of `total_sectors` sectors.
+pub fn build(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
+    if img.parameter.part_type != "GPT" {
+        bail!(
+            "the image's parameter file has TYPE: {} ; only GPT layouts are supported for SD boot cards",
+            if img.parameter.part_type.is_empty() { "(none)" } else { &img.parameter.part_type }
+        );
+    }
+    let gpt_img = gpt::build(&img.parameter, total_sectors)?;
+    let mut ops = Vec::new();
+    let mut notes = Vec::new();
+
+    // 1. Clear MBR: 1 KiB of zeros at sector 0.
+    ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
+
+    // 2. Loader.
+    let head = img.loader_entry_for_card("FlashHead");
+    let data = img.loader_entry_for_card("FlashData")?;
+    let boot = img.loader_entry_for_card("FlashBoot")?;
+    let data_sectors = data.len() as u64 / SECTOR;
+    let boot_sectors = boot.len() as u64 / SECTOR;
+    match head {
+        Ok(head) if !head.is_empty() => {
+            let head_sectors = head.len() as u64 / SECTOR;
+            ops.push(Op { step: "Loader".into(), sector: IDBLOCK_POS, sectors: head_sectors, source: Source::Bytes(head.into()) });
+            notes.push(format!("loader: RKNS header {head_sectors} sectors, DDR {data_sectors} sectors, boot {boot_sectors} sectors at sector {IDBLOCK_POS}"));
+        }
+        _ => {
+            // Legacy chips without a FlashHead entry: a 2 KiB id block built by the tool.
+            let idb = legacy_idb(data_sectors, boot_sectors);
+            ops.push(Op { step: "Loader".into(), sector: IDBLOCK_POS, sectors: 4, source: Source::Bytes(idb.into()) });
+            notes.push(format!("loader: legacy id block, DDR {data_sectors} sectors, boot {boot_sectors} sectors at sector {IDBLOCK_POS}"));
+        }
+    }
+    ops.push(Op { step: "Loader".into(), sector: IDBLOCK_POS + 4, sectors: data_sectors, source: Source::Bytes(data.into()) });
+    ops.push(Op { step: "Loader".into(), sector: IDBLOCK_POS + 4 + data_sectors, sectors: boot_sectors, source: Source::Bytes(boot.into()) });
+    let loader_end = IDBLOCK_POS + 4 + data_sectors + boot_sectors;
+    for p in &img.parameter.partitions {
+        if p.offset < loader_end {
+            bail!("partition {} at sector {} overlaps the loader (sectors {IDBLOCK_POS}..{loader_end})", p.name, p.offset);
+        }
+    }
+
+    // 3. Firmware items.
+    for item in &img.af.items {
+        if item.nand_addr == 0xffff_ffff || item.size == 0 || item.is_reserved() {
+            continue;
+        }
+        if item.name.eq_ignore_ascii_case("parameter") {
+            // GPT layouts get their table from the GPT step; the parameter item is not written.
+            continue;
+        }
+        let start = item.nand_addr as u64;
+        let part = img.parameter.partition(&item.name);
+        let part_sectors = match part {
+            Some(p) => match p.size {
+                Some(s) => s,
+                None => gpt::grow_end(total_sectors).saturating_sub(start),
+            },
+            None => {
+                // SDDiskTool trusts nand_addr from the packer; without a partition the size is
+                // whatever is left on the card (its nand_size field is 0xffffffff then).
+                if item.nand_size != 0xffff_ffff && item.nand_size != 0 {
+                    item.nand_size as u64
+                } else {
+                    total_sectors.saturating_sub(start)
+                }
+            }
+        };
+        if let Some(p) = part {
+            if p.offset != start {
+                bail!(
+                    "item {} is packed for sector {} but the parameter puts partition {} at sector {}",
+                    item.name, start, p.name, p.offset
+                );
+            }
+        }
+        let head = img.read_range(item.offset, std::cmp::min(item.size, 28) as usize)?;
+        if let Some(sh) = SparseHeader::parse(&head) {
+            sh.validate()?;
+            let unsparsed_sectors = sectors_for(sh.expanded_size());
+            if unsparsed_sectors > part_sectors {
+                bail!(
+                    "{}: the unpacked image ({} sectors) is larger than the partition ({} sectors)",
+                    item.name, unsparsed_sectors, part_sectors
+                );
+            }
+            if start + part_sectors > total_sectors {
+                bail!("{}: partition end {} is beyond the card size {}", item.name, start + part_sectors, total_sectors);
+            }
+            let step = item.name.clone();
+            // Erase the unpacked extent, then the last 64 sectors of the partition.
+            ops.push(Op { step: step.clone(), sector: start, sectors: unsparsed_sectors, source: Source::Zero });
+            if part_sectors >= 0x40 {
+                ops.push(Op { step: step.clone(), sector: start + part_sectors - 0x40, sectors: 0x40, source: Source::Zero });
+            }
+            let chunks = sparse::walk_chunks(&sh, item.offset, item.size, |o, l| img.read_range(o, l))?;
+            let mut raw = 0u64;
+            let mut fill = 0u64;
+            let mut dont_care = 0u64;
+            for c in chunks {
+                if c.is_empty() {
+                    continue;
+                }
+                let sec = start + c.out() / SECTOR;
+                let n = sectors_for(c.len());
+                match c {
+                    Chunk::Raw { data_offset, len, .. } => {
+                        raw += len;
+                        ops.push(Op { step: step.clone(), sector: sec, sectors: n, source: Source::File { offset: data_offset, len } });
+                    }
+                    Chunk::Fill { pattern, len, .. } => {
+                        fill += len;
+                        ops.push(Op { step: step.clone(), sector: sec, sectors: n, source: Source::Fill(pattern) });
+                    }
+                    Chunk::DontCare { len, .. } => {
+                        dont_care += len;
+                    }
+                }
+            }
+            notes.push(format!(
+                "{}: sparse image, {} unpacked ({} raw, {} fill, {} skipped) at sector {}",
+                item.name,
+                crate::util::human_bytes(sh.expanded_size()),
+                crate::util::human_bytes(raw),
+                crate::util::human_bytes(fill),
+                crate::util::human_bytes(dont_care),
+                start
+            ));
+        } else {
+            let n = sectors_for(item.size);
+            if n > part_sectors {
+                bail!("{}: image ({} sectors) is larger than the partition ({} sectors)", item.name, n, part_sectors);
+            }
+            if start + n > total_sectors {
+                bail!("{}: end {} is beyond the card size {}", item.name, start + n, total_sectors);
+            }
+            ops.push(Op { step: item.name.clone(), sector: start, sectors: n, source: Source::File { offset: item.offset, len: item.size } });
+            notes.push(format!("{}: {} at sector {}", item.name, crate::util::human_bytes(item.size), start));
+        }
+    }
+
+    // 4. GPT: primary (34 sectors at 0), backup (33 sectors at total - 33).
+    ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(gpt_img.primary.clone().into()) });
+    ops.push(Op { step: "GPT".into(), sector: gpt::backup_sector(total_sectors), sectors: 33, source: Source::Bytes(gpt_img.backup.clone().into()) });
+
+    Ok(Plan { total_sectors, ops, gpt: gpt_img, notes })
+}
+
+/// The 2 KiB id block SDDiskTool writes for chips without an RKNS `FlashHead` entry. Sector 0
+/// carries the tag, the code offsets and sizes and is RC4 scrambled; the rest is zero except for a
+/// flag word (1 = SD boot card) in sector 1.
+pub fn legacy_idb(data_sectors: u64, boot_sectors: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 2048];
+    b[0..4].copy_from_slice(&0x0ff0_aa55u32.to_le_bytes());
+    b[0x0c..0x0e].copy_from_slice(&4u16.to_le_bytes());
+    b[0x0e..0x10].copy_from_slice(&4u16.to_le_bytes());
+    b[0x1fa..0x1fc].copy_from_slice(&(data_sectors as u16).to_le_bytes());
+    b[0x1fc..0x1fe].copy_from_slice(&((data_sectors + boot_sectors) as u16).to_le_bytes());
+    crate::rc4::rc4_sectors(&mut b[..512]);
+    b[0x268..0x26c].copy_from_slice(&1u32.to_le_bytes());
+    b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_with(ops: Vec<Op>) -> Plan {
+        let p = crate::parameter::Parameter::parse("TYPE: GPT\nCMDLINE:mtdparts=rk29xxnand:0x10@0x40(a),-@0x100(b:grow)\n").unwrap();
+        let g = gpt::build(&p, 0x10000).unwrap();
+        Plan { total_sectors: 0x10000, ops, gpt: g, notes: vec![] }
+    }
+
+    #[test]
+    fn flatten_overrides_zero_with_data() {
+        let plan = plan_with(vec![
+            Op { step: "s".into(), sector: 100, sectors: 10, source: Source::Zero },
+            Op { step: "s".into(), sector: 102, sectors: 3, source: Source::Fill([1, 2, 3, 4]) },
+            Op { step: "s".into(), sector: 108, sectors: 4, source: Source::File { offset: 1000, len: 2048 } },
+        ]);
+        let f = plan.flattened();
+        assert_eq!(f.len(), 4);
+        assert_eq!((f[0].sector, f[0].sectors), (100, 2));
+        assert_eq!(f[0].source, Source::Zero);
+        assert_eq!((f[1].sector, f[1].sectors), (102, 3));
+        assert_eq!((f[2].sector, f[2].sectors), (105, 3));
+        assert_eq!((f[3].sector, f[3].sectors), (108, 4));
+        assert_eq!(f[3].source, Source::File { offset: 1000, len: 2048 });
+    }
+
+    #[test]
+    fn flatten_splits_file_sources() {
+        let plan = plan_with(vec![
+            Op { step: "s".into(), sector: 0, sectors: 8, source: Source::File { offset: 0, len: 4096 } },
+            Op { step: "s".into(), sector: 2, sectors: 2, source: Source::Zero },
+        ]);
+        let f = plan.flattened();
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0].source, Source::File { offset: 0, len: 1024 });
+        assert_eq!(f[1].source, Source::Zero);
+        assert_eq!(f[2].source, Source::File { offset: 2048, len: 2048 });
+        assert_eq!((f[2].sector, f[2].sectors), (4, 4));
+    }
+}

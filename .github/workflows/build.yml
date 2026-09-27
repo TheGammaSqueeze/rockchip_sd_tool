@@ -1,0 +1,75 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: rockchip_sd_tool-linux-x86_64
+            bin: rockchip_sd_tool
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: rockchip_sd_tool-linux-aarch64
+            bin: rockchip_sd_tool
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rockchip_sd_tool-windows-x86_64
+            bin: rockchip_sd_tool.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: rockchip_sd_tool-macos-arm64
+            bin: rockchip_sd_tool
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: rockchip_sd_tool-macos-x86_64
+            bin: rockchip_sd_tool
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/
+          cp README.md LICENSE dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Zip
+        run: |
+          cd artifacts
+          for d in */; do (cd "$d" && zip -r "../${d%/}.zip" .); done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
