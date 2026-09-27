@@ -29,7 +29,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: rockchip_sd_tool-macos-arm64
             bin: rockchip_sd_tool
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: rockchip_sd_tool-macos-x86_64
             bin: rockchip_sd_tool
