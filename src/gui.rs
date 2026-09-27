@@ -245,14 +245,16 @@ impl App {
         };
         let spec = JobSpec { image: img.path.clone(), output, size, verify: self.verify, xz_level: 3, verify_blocks: true };
         let target_desc = storage.label();
-        let use_helper = is_device && !elevate::is_privileged();
+        let use_helper = is_device && elevate::needs_helper();
         let handle = if use_helper {
-            let progress_file = std::env::temp_dir().join(format!(
-                "rockchip_sd_tool_{}_{}.progress",
-                std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-            ));
-            let _ = std::fs::write(&progress_file, b"");
+            let dir = match elevate::job_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    self.outcome = Some((false, format!("{e:#}")));
+                    return;
+                }
+            };
+            let progress_file = dir.join("progress");
             match elevate::spawn_helper(&spec, &progress_file) {
                 Ok(child) => JobHandle::Helper { child, progress_file, read: 0, finished: None },
                 Err(e) => {
@@ -346,6 +348,9 @@ impl App {
                     };
                     let _ = std::fs::remove_file(&*progress_file);
                     let _ = std::fs::remove_file(elevate::cancel_path(progress_file));
+                    if let Some(dir) = progress_file.parent() {
+                        let _ = std::fs::remove_dir(dir);
+                    }
                     finished = Some(r);
                 }
             }
@@ -662,6 +667,9 @@ impl App {
                 }
                 if !elevate::is_privileged() {
                     ui.label(RichText::new("You will be asked for your password to write to the card.").weak());
+                }
+                if cfg!(target_os = "macos") {
+                    ui.label(RichText::new("macOS may also ask to allow access to removable volumes; allow it.").weak());
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {

@@ -86,11 +86,8 @@ mod imp {
     impl BlockDevice {
         pub fn open_for_write(path: &str) -> Result<BlockDevice> {
             crate::disks::prepare_for_write(path)?;
-            let mut opts = OpenOptions::new();
-            opts.read(true).write(true);
-            #[cfg(target_os = "linux")]
-            opts.custom_flags(libc::O_EXCL);
-            let file = opts.open(path).with_context(|| format!("cannot open {path} for writing (is it mounted or in use?)"))?;
+            let file = open_rw(path)?;
+            set_nocache(&file);
             let size = device_size(&file)?;
             let direct = open_direct(path).ok();
             Ok(BlockDevice { path: path.to_string(), file, direct, size, writable: true })
@@ -98,6 +95,7 @@ mod imp {
 
         pub fn open_for_read(path: &str) -> Result<BlockDevice> {
             let file = File::open(path).with_context(|| format!("cannot open {path} for reading"))?;
+            set_nocache(&file);
             let size = device_size(&file)?;
             let direct = open_direct(path).ok();
             Ok(BlockDevice { path: path.to_string(), file, direct, size, writable: false })
@@ -116,6 +114,78 @@ mod imp {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn open_rw(path: &str) -> Result<File> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true);
+        #[cfg(target_os = "linux")]
+        opts.custom_flags(libc::O_EXCL);
+        opts.open(path).with_context(|| format!("cannot open {path} for writing (is it mounted or in use?)"))
+    }
+
+    /// macOS: the program never runs as root. Like Raspberry Pi Imager, it asks the system's
+    /// `authopen` helper (which shows the administrator password dialog) to open the raw disk
+    /// and hand the descriptor back over a socket, so the image file is still read with the
+    /// user's own permissions (macOS privacy rules keep even root out of Downloads).
+    #[cfg(target_os = "macos")]
+    fn open_rw(path: &str) -> Result<File> {
+        use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+        if unsafe { libc::geteuid() } == 0 {
+            return OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("cannot open {path} for writing"));
+        }
+        let (parent, child) = UnixStream::pair()?;
+        let child_fd = child.into_raw_fd();
+        let mut cmd = Command::new("/usr/libexec/authopen");
+        cmd.arg("-stdoutpipe").arg("-o").arg(format!("{}", libc::O_RDWR)).arg(path);
+        cmd.stdin(Stdio::null()).stderr(Stdio::piped());
+        cmd.stdout(unsafe { Stdio::from_raw_fd(child_fd) });
+        let mut proc_ = cmd.spawn().context("cannot start /usr/libexec/authopen")?;
+        // Receive the descriptor (SCM_RIGHTS) from authopen.
+        let mut data = [0u8; 16];
+        let mut iov = libc::iovec { iov_base: data.as_mut_ptr() as *mut libc::c_void, iov_len: data.len() };
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+        let mut cbuf = vec![0u8; space];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+        let mut fd: libc::c_int = -1;
+        loop {
+            let n = unsafe { libc::recvmsg(parent.as_raw_fd(), &mut msg, 0) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if n > 0 {
+                let c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                if !c.is_null() && unsafe { (*c).cmsg_type } == libc::SCM_RIGHTS {
+                    fd = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::c_int) };
+                }
+            }
+            break;
+        }
+        drop(parent);
+        let status = proc_.wait()?;
+        let mut err = String::new();
+        if let Some(mut e) = proc_.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut err);
+        }
+        if !status.success() || fd < 0 {
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+            let err = err.trim();
+            if err.is_empty() {
+                bail!("access to {path} was not granted (the administrator password dialog was cancelled or failed)");
+            }
+            bail!("cannot open {path}: {err}");
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
     #[cfg(target_os = "linux")]
     fn open_direct(path: &str) -> Result<File> {
         Ok(OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path)?)
@@ -123,12 +193,10 @@ mod imp {
 
     #[cfg(target_os = "macos")]
     fn open_direct(path: &str) -> Result<File> {
-        use std::os::unix::io::AsRawFd;
-        let f = File::open(path)?;
-        unsafe {
-            libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1);
-        }
-        Ok(f)
+        // The raw device (/dev/rdiskN) is unbuffered by nature; a second plain handle would need
+        // its own authorization, so verification reads reuse the main handle with F_NOCACHE.
+        let _ = path;
+        bail!("not used on macOS")
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -182,7 +250,14 @@ mod imp {
         }
         fn flush(&mut self) -> Result<()> {
             if self.writable {
-                self.file.sync_all().context("sync failed")?;
+                if let Err(e) = self.file.sync_all() {
+                    // Raw devices on macOS (/dev/rdiskN) answer fsync with ENOTTY: writes to them
+                    // are unbuffered, so there is nothing to flush.
+                    let benign = matches!(e.raw_os_error(), Some(libc::ENOTTY) | Some(libc::EINVAL)) && cfg!(target_os = "macos");
+                    if !benign {
+                        return Err(e).context("sync failed");
+                    }
+                }
                 drop_cache(&self.file);
             }
             Ok(())
@@ -194,6 +269,20 @@ mod imp {
         }
         fn description(&self) -> String {
             format!("device {}", self.path)
+        }
+    }
+
+    fn set_nocache(f: &File) {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = f;
         }
     }
 

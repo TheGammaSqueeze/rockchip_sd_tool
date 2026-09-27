@@ -217,8 +217,8 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                 bail!("--size is required when writing to a file (the size of the SD card the image is for)");
             }
             if is_dev {
-                if !elevate::is_privileged() {
-                    bail!("writing to {to} needs administrator rights (run with sudo)");
+                if elevate::needs_helper() {
+                    bail!("writing to {to} needs root rights (run with sudo)");
                 }
                 if let Some(d) = disks::find(&to) {
                     if d.system {

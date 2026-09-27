@@ -1,14 +1,36 @@
 //! Running the write with the privileges raw disk access needs.
 //!
 //! Windows: the executable carries a `requireAdministrator` manifest, so the whole program already
-//! runs elevated. Linux and macOS: the GUI launches a second copy of itself as root through
-//! `pkexec` (or `sudo`) and `osascript ... with administrator privileges`; that helper writes JSON
-//! progress lines to a file the GUI polls, and stops when a `.cancel` file appears next to it.
+//! runs elevated. macOS: the disk is opened through the system `authopen` helper (see
+//! `blockdev`), the program itself stays unprivileged. Linux: the GUI launches a second copy of
+//! itself as root through `pkexec` (or `sudo -A`); that helper writes JSON progress lines to a
+//! file the GUI polls, and stops when a `.cancel` file appears next to it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+
+/// True when card writes must go through a separate root helper process. Windows runs
+/// elevated from the start and macOS gets the disk descriptor from `authopen`, so only Linux
+/// without root needs the helper.
+pub fn needs_helper() -> bool {
+    cfg!(target_os = "linux") && !is_privileged()
+}
+
+/// Creates a private directory for the progress and cancel files of one job. A file created by
+/// the user directly in the sticky /tmp cannot be opened by the root helper on Linux
+/// (fs.protected_regular), so the files live in a directory of their own.
+pub fn job_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "rockchip_sd_tool_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    Ok(dir)
+}
 
 pub fn is_privileged() -> bool {
     #[cfg(unix)]
@@ -47,11 +69,6 @@ pub fn helper_args(spec: &crate::job::JobSpec, progress_file: &Path) -> Vec<Stri
         a.push("--no-block-verify".into());
     }
     a
-}
-
-#[allow(dead_code)]
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Launches the privileged helper. Returns the child process to wait on.
@@ -95,33 +112,10 @@ pub fn spawn_helper(spec: &crate::job::JobSpec, progress_file: &Path) -> Result<
         }
         bail!("neither pkexec nor sudo is available; run this program as root to write to a card");
     }
-    #[cfg(target_os = "macos")]
-    {
-        let mut cmd = shell_quote(&exe.to_string_lossy());
-        for a in &args {
-            cmd.push(' ');
-            cmd.push_str(&shell_quote(a));
-        }
-        let script = format!("do shell script {} with administrator privileges", applescript_quote(&cmd));
-        let child = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("cannot start osascript")?;
-        return Ok(child);
-    }
     #[allow(unreachable_code)]
     {
         bail!("privilege elevation is not supported on this platform; run the program as an administrator")
     }
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(target_os = "linux")]

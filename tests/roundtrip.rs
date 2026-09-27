@@ -208,7 +208,7 @@ fn check_card(path: &PathBuf, total_sectors: u64, fx: &Fixture) {
     assert_eq!((entries[0].first_lba, entries[0].last_lba), (0x2000, 0x23ff));
     assert_eq!(entries[2].attributes, gpt::ATTR_BOOTABLE);
     assert_eq!(entries[4].first_lba, 0x3d00);
-    assert_eq!(entries[4].last_lba, gpt::last_usable_lba(total_sectors));
+    assert_eq!(entries[4].last_lba, gpt::grow_end(total_sectors) - 1);
     for e in &entries {
         assert_eq!(e.unique_guid[7] >> 4, 4, "uuid version");
         assert_eq!(e.unique_guid[8] & 0xc0, 0x80, "uuid variant");
@@ -285,7 +285,7 @@ fn xz_image_roundtrip() {
     let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 0, verify_blocks: true };
     job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap();
     assert!(std::fs::metadata(&out).unwrap().len() < 4 << 20, "zero areas must compress away");
-    assert_eq!(gpt::last_usable_lba(total_sectors), total_sectors - 65);
+    assert_eq!(gpt::grow_end(total_sectors), total_sectors - 64);
     check_card(&out, total_sectors, &fx);
     // The verify command reads compressed images too.
     job::verify_only(&fx.image, &out.to_string_lossy(), &mut |_| {}, &Cancel::new()).unwrap();

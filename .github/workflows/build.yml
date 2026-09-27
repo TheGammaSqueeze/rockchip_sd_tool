@@ -42,6 +42,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev
@@ -56,14 +60,14 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/
-          cp README.md LICENSE dist/
+          cp README.md LICENSE CHANGELOG.md dist/
       - name: macOS app bundle
         if: runner.os == 'macOS'
         run: |
           APP="dist/Rockchip SD Tool.app"
           mkdir -p "$APP/Contents/MacOS"
           cp target/${{ matrix.target }}/release/rockchip_sd_tool "$APP/Contents/MacOS/"
-          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -71,8 +75,8 @@ jobs:
             <key>CFBundleName</key><string>Rockchip SD Tool</string>
             <key>CFBundleDisplayName</key><string>Rockchip SD Tool</string>
             <key>CFBundleIdentifier</key><string>com.thegammasqueeze.rockchip-sd-tool</string>
-            <key>CFBundleVersion</key><string>1.0.1</string>
-            <key>CFBundleShortVersionString</key><string>1.0.1</string>
+            <key>CFBundleVersion</key><string>${{ steps.ver.outputs.version }}</string>
+            <key>CFBundleShortVersionString</key><string>${{ steps.ver.outputs.version }}</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleExecutable</key><string>rockchip_sd_tool</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -86,7 +90,7 @@ jobs:
           (cd dist && ditto -c -k --keepParent "Rockchip SD Tool.app" "Rockchip_SD_Tool.app.zip" && rm -rf "Rockchip SD Tool.app")
       - uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}-${{ steps.ver.outputs.version }}
           path: dist/*
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -95,6 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           path: artifacts
@@ -102,6 +107,16 @@ jobs:
         run: |
           cd artifacts
           for d in */; do (cd "$d" && zip -r "../${d%/}.zip" .); done
+      - name: Release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The changelog section for this version, followed by the install instructions.
+          awk -v v="$VERSION" '/^## /{p = ($2 == v)} p' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then echo "## $VERSION" > notes.md; fi
+          echo >> notes.md
+          cat .github/release_instructions.md >> notes.md
       - uses: softprops/action-gh-release@v2
         with:
+          name: Rockchip SD Tool ${{ github.ref_name }}
+          body_path: notes.md
           files: artifacts/*.zip

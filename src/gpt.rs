@@ -6,8 +6,9 @@
 //! last one, header in the last sector). Partition type and unique GUIDs are random version 4
 //! UUIDs unless the parameter file overrides the unique GUID with a `uuid:` line. The tool
 //! reserves 64 sectors at the end of the disk when the card is 4 GiB or larger (33 below that), so
-//! `last usable LBA = total - 65` and a `grow` partition ends there; with the usual card sizes that
-//! makes the grow partition end on a 64-sector boundary (SDDiskTool v1.65 release note).
+//! a `grow` partition ends at `total - 65`; with the usual card sizes that makes it end on a
+//! 64-sector boundary (SDDiskTool v1.65 release note). The header's last usable LBA is written
+//! as `total - 34` (see [`last_usable_lba`]).
 
 use anyhow::{bail, Result};
 use rand::Rng as _;
@@ -78,14 +79,18 @@ pub fn reserved_tail(total_sectors: u64) -> u64 {
     }
 }
 
-/// The last usable LBA the tool writes into the header; a grow partition ends here too.
+/// The last usable LBA written into the header: the sector before the backup entries, which is
+/// where the RG DS Plus firmware (on first boot) and Windows (when the disk is released) move it
+/// anyway. SDDiskTool itself writes `total - 65` on big cards, which leaves the header
+/// inconsistent with its backup entry position and gets "repaired" by both.
 pub fn last_usable_lba(total_sectors: u64) -> u64 {
-    total_sectors - reserved_tail(total_sectors) - 1
+    total_sectors - 34
 }
 
-/// The end (exclusive) of a grow partition.
+/// The end (exclusive) of a grow partition: SDDiskTool's value (64 sectors of tail reserve on
+/// cards of 4 GiB and more), so the partition entries match its output exactly.
 pub fn grow_end(total_sectors: u64) -> u64 {
-    last_usable_lba(total_sectors) + 1
+    total_sectors - reserved_tail(total_sectors)
 }
 
 /// Sectors the card must have so that every fixed partition plus the backup GPT fits and the
@@ -128,6 +133,9 @@ pub fn build_with(param: &Parameter, total_sectors: u64, mut guid: impl FnMut() 
             Some(s) => first + s - 1,
             None => grow_end(total_sectors) - 1,
         };
+        if p.is_grow() && last < first {
+            bail!("partition {} has no room on this card", p.name);
+        }
         if last > last_usable {
             bail!("partition {} ends at sector {} beyond the last usable sector {}", p.name, last, last_usable);
         }
@@ -286,7 +294,7 @@ mod tests {
         assert_eq!(h.my_lba, 1);
         assert_eq!(h.alternate_lba, 250347519);
         assert_eq!(h.first_usable, 34);
-        assert_eq!(h.last_usable, 250347455);
+        assert_eq!(h.last_usable, 250347486);
         assert_eq!(h.entries_lba, 2);
         assert_eq!(g.entries[0].first_lba, 0x2000);
         assert_eq!(g.entries[0].last_lba, 0x3fff);
@@ -307,8 +315,8 @@ mod tests {
         let p = Parameter::parse(text).unwrap();
         assert!(build(&p, 0x3000).is_err());
         assert!(build(&p, minimum_sectors(&p)).is_ok());
-        // Small cards reserve 33 sectors, big ones 64.
-        assert_eq!(last_usable_lba(0x7f_ffff), 0x7f_ffff - 34);
-        assert_eq!(last_usable_lba(0x80_0000), 0x80_0000 - 65);
+        // Small cards reserve 33 sectors for the grow partition end, big ones 64.
+        assert_eq!(grow_end(0x7f_ffff), 0x7f_ffff - 33);
+        assert_eq!(grow_end(0x80_0000), 0x80_0000 - 64);
     }
 }

@@ -51,8 +51,10 @@ pass the image path as the only argument, or drag an image file onto the window.
    internal disks are hidden unless you ask for them and the system disk is never
    selectable). Or switch to *Image file* and write to a `.img` / `.img.xz` for a
    card of a chosen size.
-3. **Write**. On Linux and macOS you are asked for your password (raw disk access needs
-   root); on Windows the program asks for administrator rights when it starts.
+3. **Write**. On Linux you are asked for your password (a root helper does the raw disk
+   writing); on macOS the system asks for the administrator password to open the disk,
+   like Raspberry Pi Imager, and the program itself keeps running as you; on Windows the
+   program asks for administrator rights when it starts.
 
 Every block is flushed to the card, read back and compared right after it is
 written; a block that reads back wrong is rewritten, up to three attempts, after
@@ -83,7 +85,8 @@ post-write verification seek instead of decoding the whole file.
 
 Flags: `--no-verify` skips the final full verification pass, `--no-block-verify`
 skips the per-block read-back, `--yes` skips the confirmation for devices,
-`--xz-level N` sets the xz preset (default 3).
+`--xz-level N` sets the xz preset (default 3). On Linux the `write` command needs
+`sudo` for a device; on macOS it asks for the administrator password itself.
 
 ## What gets written (the SDDiskTool SD Boot layout)
 
@@ -110,14 +113,16 @@ Details that matter for a byte-identical result:
 * The `parameter` item is not written for GPT layouts; the GPT is built from its
   `mtdparts` line. `misc` is written verbatim (the "boot-recovery / rk_fwupdate"
   injection only happens in SDDiskTool's upgrade-card mode).
-* GPT: first usable LBA 34; last usable LBA `total - 65` on cards of 4 GiB and more
-  (`total - 34` below), and a `grow` partition ends there; partition type and unique
-  GUIDs are random version 4 UUIDs (a `uuid:name=...` parameter line overrides the
-  unique GUID); `:bootable` sets attribute bit 2; the backup header's entry LBA is
-  `total - 33`. Note: the RG DS Plus firmware rewrites the header's last usable LBA to
-  `total - 34` on first boot, and Windows does the same as soon as the disk is released
-  after writing, so a card read back later differs in the header (not the entries).
-  The tool therefore verifies through its own locked handle before releasing the disk.
+* GPT: first usable LBA 34; a `grow` partition ends at `total - 65` on cards of 4 GiB
+  and more (`total - 34` below), exactly like SDDiskTool; partition type and unique GUIDs
+  are random version 4 UUIDs (a `uuid:name=...` parameter line overrides the unique
+  GUID); `:bootable` sets attribute bit 2; the backup header's entry LBA is `total - 33`.
+  One deliberate difference: SDDiskTool writes the header's last usable LBA as
+  `total - 65` too, which contradicts its own backup entry position; the RG DS Plus
+  firmware rewrites it to `total - 34` on first boot and Windows does the same as soon as
+  the disk is released. This tool writes `total - 34` from the start, so the header is
+  consistent, nothing rewrites it, and the card is byte for byte what the device would
+  make of a SDDiskTool card.
 * Items over 4 GiB use afptool's extension (high 32 bits of offset and size stored
   behind an `H` marker inside the file name field), which is honoured.
 

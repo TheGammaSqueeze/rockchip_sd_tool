@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::plan;
 use crate::rkfw::RkfwImage;
@@ -50,11 +50,15 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
             }
             writer::verify_target(&ops, &img, reader.as_mut(), progress, cancel)?;
         } else {
-            // Verify through the same handle while the disk is still locked. Reads bypass the
-            // cache on every platform, and releasing the disk first would let the host rewrite
-            // the GPT header (Windows repairs a header whose last usable LBA is not total - 34,
-            // as the Rockchip device itself does on first boot) before the check runs.
-            writer::verify_target(&ops, &img, target.as_mut(), progress, cancel)?;
+            // Verify through the same handle while the disk is still locked (reads bypass the
+            // cache on every platform). The GPT is checked structurally rather than byte for
+            // byte: hosts are free to rewrite header fields they consider inconsistent, and what
+            // matters is that the table is valid and describes the same partitions.
+            let data_ops: Vec<plan::Op> = ops.iter().filter(|o| o.step != "GPT").cloned().collect();
+            writer::verify_target(&data_ops, &img, target.as_mut(), progress, cancel)?;
+            let mut head = vec![0u8; 34 * 512];
+            target.read_at(0, &mut head)?;
+            check_gpt(&plan, &head, target.as_mut()).context("GPT verification failed")?;
         }
     }
     Ok(plan)

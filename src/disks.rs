@@ -210,8 +210,37 @@ mod imp {
         d.get(key).and_then(|v| v.as_unsigned_integer().or_else(|| v.as_signed_integer().map(|i| i as u64))).unwrap_or(0)
     }
 
+    /// Whole disk (e.g. `disk0`) holding the running system: the physical store behind "/".
+    fn boot_disk() -> Option<String> {
+        let info = plist_cmd(&["info", "-plist", "/"])?;
+        let d = info.as_dictionary()?;
+        let parent = str_of(d, "ParentWholeDisk");
+        if parent.is_empty() {
+            return None;
+        }
+        // APFS: the synthesized container has physical stores on the real disk.
+        if let Some(ci) = plist_cmd(&["info", "-plist", &parent]) {
+            if let Some(cd) = ci.as_dictionary() {
+                if let Some(stores) = cd.get("APFSPhysicalStores").and_then(|v| v.as_array()) {
+                    for st in stores {
+                        if let Some(sd) = st.as_dictionary() {
+                            let dev = str_of(sd, "APFSPhysicalStore");
+                            if !dev.is_empty() {
+                                // disk0s2 -> disk0
+                                let whole = dev.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('s').to_string();
+                                return Some(whole);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(parent)
+    }
+
     pub fn list() -> Vec<DiskInfo> {
         let mut out = Vec::new();
+        let boot = boot_disk();
         let Some(root) = plist_cmd(&["list", "-plist", "physical"]) else { return out };
         let Some(dict) = root.as_dictionary() else { return out };
         let names: Vec<String> = dict
@@ -238,7 +267,9 @@ mod imp {
             let internal = bool_of(d, "Internal");
             let removable = bool_of(d, "RemovableMedia") || bool_of(d, "Removable") || bool_of(d, "Ejectable");
             let model = str_of(d, "MediaName");
-            let system = internal || bool_of(d, "SystemImage");
+            // The built-in SD slot of a Mac reports Internal, so "internal" alone does not make a
+            // disk off limits: only the boot disk and non-removable internal drives are.
+            let system = boot.as_deref() == Some(name.as_str()) || bool_of(d, "SystemImage") || (internal && !removable && bus != "SD" && bus != "USB");
             // Mount points of the volumes on this disk.
             let mut mounts = Vec::new();
             if let Some(v) = plist_cmd(&["list", "-plist", &name]) {
