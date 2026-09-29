@@ -9,6 +9,9 @@
 //!
 //! The plan is a list of sector-granular operations. Random-access targets execute it in this
 //! order; streaming targets get it flattened into ascending, non-overlapping ranges first.
+//!
+//! In [`Mode::Upgrade`] steps 1 and 4 are left out: the card keeps the partition table it already
+//! has, so nothing outside the partitions the image carries is touched and user data survives.
 
 use std::collections::BTreeMap;
 
@@ -52,11 +55,25 @@ impl Op {
     }
 }
 
+/// What a plan does to the card as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Write the loader, every partition the image carries and a fresh partition table.
+    Full,
+    /// Write the loader and every partition the image carries onto a card that already has this
+    /// layout, keeping its partition table and everything the image does not cover (userdata).
+    Upgrade,
+}
+
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub total_sectors: u64,
+    pub mode: Mode,
     pub ops: Vec<Op>,
-    pub gpt: gpt::GptImage,
+    /// The table this plan writes, or `None` in upgrade mode (the card keeps its own).
+    pub gpt: Option<gpt::GptImage>,
+    /// The partitions the card is expected to have once the plan has run.
+    pub entries: Vec<gpt::GptEntry>,
     /// Human readable summary lines.
     pub notes: Vec<String>,
 }
@@ -125,20 +142,78 @@ fn sectors_for(bytes: u64) -> u64 {
     (bytes + SECTOR - 1) / SECTOR
 }
 
-/// Builds the plan for `img` on a card of `total_sectors` sectors.
+/// Builds the plan for a full write of `img` to a card of `total_sectors` sectors.
 pub fn build(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
+    build_inner(img, total_sectors, None)
+}
+
+/// Builds the plan for upgrading a card that already carries `existing` partitions: the loader and
+/// every partition the image has an image for are rewritten, the partition table and everything
+/// else (userdata above all) are left exactly as they are.
+pub fn build_upgrade(img: &RkfwImage, total_sectors: u64, existing: &[gpt::GptEntry]) -> Result<Plan> {
+    build_inner(img, total_sectors, Some(existing))
+}
+
+/// Checks that a card's existing partitions are the layout this image expects. Every fixed
+/// partition must be at the same sector with the same size; the growing partition (userdata) only
+/// has to start at the same sector, since its size follows the card it was made for.
+pub fn check_layout(param: &crate::parameter::Parameter, existing: &[gpt::GptEntry]) -> Result<()> {
+    let advice = "this card was not made from a compatible image; write it in full instead of upgrading";
+    for p in &param.partitions {
+        let Some(e) = existing.iter().find(|e| e.name == p.name) else {
+            bail!("the card has no {} partition ({advice})", p.name);
+        };
+        if e.first_lba != p.offset {
+            bail!(
+                "the card's {} partition starts at sector {} but this image expects sector {} ({advice})",
+                p.name, e.first_lba, p.offset
+            );
+        }
+        if let Some(size) = p.size {
+            if e.sectors() != size {
+                bail!(
+                    "the card's {} partition is {} sectors but this image expects {} ({advice})",
+                    p.name, e.sectors(), size
+                );
+            }
+        }
+    }
+    for e in existing {
+        if !param.partitions.iter().any(|p| p.name == e.name) {
+            bail!("the card has an extra {} partition that this image does not know ({advice})", e.name);
+        }
+    }
+    Ok(())
+}
+
+fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptEntry]>) -> Result<Plan> {
     if img.parameter.part_type != "GPT" {
         bail!(
             "the image's parameter file has TYPE: {} ; only GPT layouts are supported for SD boot cards",
             if img.parameter.part_type.is_empty() { "(none)" } else { &img.parameter.part_type }
         );
     }
-    let gpt_img = gpt::build(&img.parameter, total_sectors)?;
+    let mode = if existing.is_some() { Mode::Upgrade } else { Mode::Full };
+    let (gpt_img, entries) = match existing {
+        Some(e) => {
+            check_layout(&img.parameter, e)?;
+            (None, e.to_vec())
+        }
+        None => {
+            let g = gpt::build(&img.parameter, total_sectors)?;
+            let entries = g.entries.clone();
+            (Some(g), entries)
+        }
+    };
     let mut ops = Vec::new();
     let mut notes = Vec::new();
 
-    // 1. Clear MBR: 1 KiB of zeros at sector 0.
-    ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
+    // 1. Clear MBR: 1 KiB of zeros at sector 0. An upgrade keeps the table that is there.
+    if mode == Mode::Full {
+        ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
+    } else {
+        notes.push("upgrade: the partition table and every partition the image does not carry (user data) are left untouched".into());
+    }
 
     // 2. Loader.
     let head = img.loader_entry_for_card("FlashHead");
@@ -179,11 +254,10 @@ pub fn build(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
         }
         let start = item.nand_addr as u64;
         let part = img.parameter.partition(&item.name);
-        let part_sectors = match part {
-            Some(p) => match p.size {
-                Some(s) => s,
-                None => gpt::grow_end(total_sectors).saturating_sub(start),
-            },
+        // Extents come from the table the card will have: the one being written, or the one it
+        // already carries when upgrading.
+        let part_sectors = match entries.iter().find(|e| e.name == item.name) {
+            Some(e) => e.sectors(),
             None => {
                 // SDDiskTool trusts nand_addr from the packer; without a partition the size is
                 // whatever is left on the card (its nand_size field is 0xffffffff then).
@@ -268,10 +342,12 @@ pub fn build(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
     }
 
     // 4. GPT: primary (34 sectors at 0), backup (33 sectors at total - 33).
-    ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(gpt_img.primary.clone().into()) });
-    ops.push(Op { step: "GPT".into(), sector: gpt::backup_sector(total_sectors), sectors: 33, source: Source::Bytes(gpt_img.backup.clone().into()) });
+    if let Some(g) = &gpt_img {
+        ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(g.primary.clone().into()) });
+        ops.push(Op { step: "GPT".into(), sector: gpt::backup_sector(total_sectors), sectors: 33, source: Source::Bytes(g.backup.clone().into()) });
+    }
 
-    Ok(Plan { total_sectors, ops, gpt: gpt_img, notes })
+    Ok(Plan { total_sectors, mode, ops, gpt: gpt_img, entries, notes })
 }
 
 /// The 2 KiB id block SDDiskTool writes for chips without an RKNS `FlashHead` entry. Sector 0
@@ -296,7 +372,8 @@ mod tests {
     fn plan_with(ops: Vec<Op>) -> Plan {
         let p = crate::parameter::Parameter::parse("TYPE: GPT\nCMDLINE:mtdparts=rk29xxnand:0x10@0x40(a),-@0x100(b:grow)\n").unwrap();
         let g = gpt::build(&p, 0x10000).unwrap();
-        Plan { total_sectors: 0x10000, ops, gpt: g, notes: vec![] }
+        let entries = g.entries.clone();
+        Plan { total_sectors: 0x10000, mode: Mode::Full, ops, gpt: Some(g), entries, notes: vec![] }
     }
 
     #[test]

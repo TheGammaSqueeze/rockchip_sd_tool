@@ -10,6 +10,10 @@ use rockchip_sd_tool::sparse;
 use rockchip_sd_tool::writer::Cancel;
 use rockchip_sd_tool::{gpt, plan, rc4};
 
+/// A second layout: boot is half the size and everything after it moves, so a card made from one
+/// is not a valid upgrade target for the other.
+const ALT_PARAMETER: &str = "FIRMWARE_VER: 1.0\nMACHINE_MODEL: Test Board\nMACHINE_ID: 007\nMANUFACTURER: Test\nMAGIC: 0x5041524B\nATAG: 0x00200800\nMACHINE: rk3568\nTYPE: GPT\nCMDLINE:mtdparts=rk29xxnand:0x00000400@0x00002000(uboot),0x00000100@0x00002400(misc),0x00000400@0x00002500(boot:bootable),0x00001000@0x00002900(super),-@0x00003900(userdata:grow)\n";
+
 const PARAMETER: &str = "FIRMWARE_VER: 1.0\nMACHINE_MODEL: Test Board\nMACHINE_ID: 007\nMANUFACTURER: Test\nMAGIC: 0x5041524B\nATAG: 0x00200800\nMACHINE: rk3568\nTYPE: GPT\nCMDLINE:mtdparts=rk29xxnand:0x00000400@0x00002000(uboot),0x00000100@0x00002400(misc),0x00000800@0x00002500(boot:bootable),0x00001000@0x00002d00(super),-@0x00003d00(userdata:grow)\n";
 
 fn scramble(mut d: Vec<u8>) -> Vec<u8> {
@@ -116,6 +120,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_param(PARAMETER)
+}
+
+fn fixture_param(parameter: &str) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut head = vec![0u8; 2048];
     head[0..4].copy_from_slice(b"RKNS");
@@ -139,15 +147,20 @@ fn fixture() -> Fixture {
             (sparse::CHUNK_CRC32, 0, vec![0, 0, 0, 0]),
         ],
     );
+    // Item placement follows the parameter this fixture was built with.
+    let parsed = rockchip_sd_tool::parameter::Parameter::parse(parameter).unwrap();
+    let boot_part = parsed.partition("boot").unwrap().size.unwrap() as u32;
+    let super_at = parsed.partition("super").unwrap().offset as u32;
+    let boot_img = if boot_img.len() as u64 > boot_part as u64 * 512 { boot_img[..boot_part as usize * 512 - 100].to_vec() } else { boot_img };
     let loader = build_loader(&head, &data, &boot);
     let af = build_af(&[
         ("package-file", 0, 0xffff_ffff, b"# NAME Relative path\n".to_vec()),
         ("bootloader", 0, 0xffff_ffff, loader.clone()),
-        ("parameter", 0x2000, 0, PARAMETER.as_bytes().to_vec()),
+        ("parameter", 0x2000, 0, parameter.as_bytes().to_vec()),
         ("uboot", 0x400, 0x2000, uboot.clone()),
         ("misc", 0x100, 0x2400, misc.clone()),
-        ("boot", 0x800, 0x2500, boot_img.clone()),
-        ("super", 0x1000, 0x2d00, super_sparse.clone()),
+        ("boot", boot_part, 0x2500, boot_img.clone()),
+        ("super", 0x1000, super_at, super_sparse.clone()),
         ("backup", 0, 0xffff_ffff, vec![]),
     ]);
     // RKFW header.
@@ -256,7 +269,7 @@ fn parses_synthetic_image() {
     assert!(img.check_loader_crc().unwrap());
     assert_eq!(img.check_md5(|_, _| {}).unwrap(), Some(true));
     let p = plan::build(&img, 0x20000).unwrap();
-    assert_eq!(p.gpt.entries.len(), 5);
+    assert_eq!(p.entries.len(), 5);
     let steps: Vec<&str> = p.ops.iter().map(|o| o.step.as_str()).collect();
     assert!(steps.starts_with(&["Clear MBR", "Loader", "Loader", "Loader", "uboot", "misc", "boot", "super"]));
     assert_eq!(&steps[steps.len() - 2..], &["GPT", "GPT"]);
@@ -267,7 +280,7 @@ fn raw_image_roundtrip() {
     let fx = fixture();
     let total_sectors = 0x20000u64; // 64 MiB card
     let out = fx.dir.path().join("card.img");
-    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 1, verify_blocks: true };
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 1, verify_blocks: true, upgrade: false };
     let mut last = None;
     job::run(&spec, &mut |p| last = Some(p), &Cancel::new()).unwrap();
     assert_eq!(last.unwrap().phase, "verify");
@@ -282,7 +295,7 @@ fn xz_image_roundtrip() {
     let fx = fixture();
     let total_sectors = 0x800000u64 + 0x1000; // just over 4 GiB: 64-sector tail reserve
     let out = fx.dir.path().join("card.img.xz");
-    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 0, verify_blocks: true };
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 0, verify_blocks: true, upgrade: false };
     job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap();
     assert!(std::fs::metadata(&out).unwrap().len() < 4 << 20, "zero areas must compress away");
     assert_eq!(gpt::grow_end(total_sectors), total_sectors - 64);
@@ -299,7 +312,7 @@ fn xz_image_roundtrip() {
 fn rejects_too_small_card() {
     let fx = fixture();
     let out = fx.dir.path().join("small.img");
-    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(0x3d00 * 512), verify: false, xz_level: 1, verify_blocks: true };
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(0x3d00 * 512), verify: false, xz_level: 1, verify_blocks: true, upgrade: false };
     let err = job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap_err();
     assert!(format!("{err:#}").contains("needs at least"), "{err:#}");
 }
@@ -308,7 +321,7 @@ fn rejects_too_small_card() {
 fn cancel_stops_the_write() {
     let fx = fixture();
     let out = fx.dir.path().join("cancel.img");
-    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(0x20000 * 512), verify: true, xz_level: 1, verify_blocks: true };
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(0x20000 * 512), verify: true, xz_level: 1, verify_blocks: true, upgrade: false };
     let cancel = Cancel::new();
     let flag = cancel.0.clone();
     let err = job::run(&spec, &mut |p| if p.step == "boot" { flag.store(true, std::sync::atomic::Ordering::Relaxed) }, &cancel).unwrap_err();
@@ -418,4 +431,69 @@ fn block_verification_can_be_disabled() {
     // The final verification pass catches the corruption instead.
     let err = writer::verify_target(&ops, &img, &mut t, &mut |_| {}, &Cancel::new()).unwrap_err();
     assert!(format!("{err:#}").contains("verification failed in uboot"));
+}
+
+#[test]
+fn upgrade_keeps_user_data_and_the_partition_table() {
+    let fx = fixture();
+    let total_sectors = 0x20000u64;
+    let out = fx.dir.path().join("card.img");
+    let path = out.to_string_lossy().to_string();
+    let full = JobSpec { image: fx.image.clone(), output: path.clone(), size: Some(total_sectors * 512), verify: true, xz_level: 1, verify_blocks: true, upgrade: false };
+    job::run(&full, &mut |_| {}, &Cancel::new()).unwrap();
+
+    // What an upgrade must preserve: the table (disk GUID and partition GUIDs included) and
+    // everything the image does not carry, above all the user data.
+    let table_before = std::fs::read(&out).unwrap()[..34 * 512].to_vec();
+    let userdata_at = 0x3d00u64 * 512;
+    let marker: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 253) as u8).collect();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
+        f.seek(SeekFrom::Start(userdata_at)).unwrap();
+        f.write_all(&marker).unwrap();
+        // Something in a partition the image does carry, to prove it is rewritten.
+        f.seek(SeekFrom::Start(0x2500 * 512)).unwrap();
+        f.write_all(&[0xa5u8; 4096]).unwrap();
+    }
+
+    let upgrade = JobSpec { size: None, upgrade: true, ..full.clone() };
+    let plan = job::run(&upgrade, &mut |_| {}, &Cancel::new()).unwrap();
+    assert_eq!(plan.mode, rockchip_sd_tool::plan::Mode::Upgrade);
+    assert!(plan.gpt.is_none(), "an upgrade writes no partition table");
+    assert!(plan.ops.iter().all(|o| o.step != "GPT" && o.step != "Clear MBR"));
+
+    let after = std::fs::read(&out).unwrap();
+    assert_eq!(&after[..34 * 512], &table_before[..], "the partition table must be untouched");
+    assert_eq!(&after[userdata_at as usize..userdata_at as usize + marker.len()], &marker[..], "user data must be untouched");
+    // Every partition the image carries is back to the image contents.
+    check_card(&out, total_sectors, &fx);
+}
+
+#[test]
+fn upgrade_refuses_a_card_with_a_different_layout() {
+    let fx = fixture();
+    let alt = fixture_param(ALT_PARAMETER);
+    let total_sectors = 0x20000u64;
+    let out = alt.dir.path().join("alt_card.img");
+    let path = out.to_string_lossy().to_string();
+    let full = JobSpec { image: alt.image.clone(), output: path.clone(), size: Some(total_sectors * 512), verify: false, xz_level: 1, verify_blocks: true, upgrade: false };
+    job::run(&full, &mut |_| {}, &Cancel::new()).unwrap();
+
+    let before = std::fs::read(&out).unwrap();
+    let upgrade = JobSpec { image: fx.image.clone(), size: None, upgrade: true, ..full };
+    let err = job::run(&upgrade, &mut |_| {}, &Cancel::new()).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("boot") && msg.contains("write it in full"), "{msg}");
+    assert_eq!(std::fs::read(&out).unwrap(), before, "a refused upgrade must not touch the card");
+}
+
+#[test]
+fn upgrade_refuses_a_card_without_a_partition_table() {
+    let fx = fixture();
+    let out = fx.dir.path().join("blank.img");
+    std::fs::write(&out, vec![0u8; 0x20000 * 512]).unwrap();
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: None, verify: false, xz_level: 1, verify_blocks: true, upgrade: true };
+    let err = job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap_err();
+    assert!(format!("{err:#}").contains("no GPT"), "{err:#}");
 }

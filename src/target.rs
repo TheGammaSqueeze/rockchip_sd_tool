@@ -110,10 +110,25 @@ impl Target for FileTarget {
 
 /// Opens the right target for a path or device name.
 pub fn open_output(spec: &str, size: u64, xz_level: u32) -> Result<Box<dyn Target>> {
+    open_output_ex(spec, size, xz_level, false)
+}
+
+/// As [`open_output`]; with `upgrade` the target must already exist and is opened in place, so
+/// nothing outside the ranges the plan writes is disturbed.
+pub fn open_output_ex(spec: &str, size: u64, xz_level: u32, upgrade: bool) -> Result<Box<dyn Target>> {
     if crate::disks::is_block_device_path(spec) {
-        return Ok(Box::new(crate::blockdev::BlockDevice::open_for_write(spec)?));
+        return Ok(Box::new(crate::blockdev::BlockDevice::open_for_write_ex(spec, upgrade)?));
     }
     let path = Path::new(spec);
+    if upgrade {
+        if is_xz_path(spec) {
+            bail!("a compressed image cannot be upgraded in place; upgrade a card or a raw .img file");
+        }
+        if !path.exists() {
+            bail!("{} does not exist; an upgrade needs a card or image that already has the layout", path.display());
+        }
+        return Ok(Box::new(FileTarget::open_existing(path, true)?));
+    }
     if size == 0 {
         bail!("an image size (the SD card size) is required when writing to a file");
     }

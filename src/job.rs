@@ -22,6 +22,9 @@ pub struct JobSpec {
     pub xz_level: u32,
     /// Read every block back right after writing it and rewrite it on mismatch.
     pub verify_blocks: bool,
+    /// Keep the card's partition table and user data: write only the partitions the image
+    /// carries, onto a card that already has this layout.
+    pub upgrade: bool,
 }
 
 /// Runs the job, reporting progress through `progress`.
@@ -29,16 +32,25 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
     let img = RkfwImage::open(&spec.image)?;
     let is_dev = crate::disks::is_block_device_path(&spec.output);
     let mut target: Box<dyn target::Target> = if is_dev {
-        Box::new(crate::blockdev::BlockDevice::open_for_write(&spec.output)?)
+        Box::new(crate::blockdev::BlockDevice::open_for_write_ex(&spec.output, spec.upgrade)?)
     } else {
-        let size = spec.size.ok_or_else(|| anyhow::anyhow!("a card size is required when writing to a file"))?;
-        target::open_output(&spec.output, size, spec.xz_level)?
+        let size = if spec.upgrade {
+            0
+        } else {
+            spec.size.ok_or_else(|| anyhow::anyhow!("a card size is required when writing to a file"))?
+        };
+        target::open_output_ex(&spec.output, size, spec.xz_level, spec.upgrade)?
     };
     let total_sectors = target.size() / 512;
     if total_sectors == 0 {
         bail!("the target reports a size of zero");
     }
-    let plan = plan::build(&img, total_sectors)?;
+    let plan = if spec.upgrade {
+        let entries = read_existing_table(target.as_mut())?;
+        plan::build_upgrade(&img, total_sectors, &entries)?
+    } else {
+        plan::build(&img, total_sectors)?
+    };
     let opts = writer::WriteOptions { verify_blocks: spec.verify_blocks, ..Default::default() };
     let ops = writer::write_plan(&plan, &img, target.as_mut(), opts, progress, cancel)?;
     if spec.verify {
@@ -64,12 +76,29 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
     Ok(plan)
 }
 
+/// Reads the partition table a card already has, for an upgrade.
+pub fn read_existing_table(t: &mut dyn target::Target) -> Result<Vec<crate::gpt::GptEntry>> {
+    if t.size() < 34 * 512 {
+        bail!("the target is too small to hold a partition table");
+    }
+    let mut head = vec![0u8; 34 * 512];
+    t.read_at(0, &mut head).context("cannot read the card's partition table")?;
+    let (_, entries) = crate::gpt::read_table(&head)
+        .context("cannot use this card for an upgrade; write it in full instead")?;
+    Ok(entries)
+}
+
 /// Verifies an existing card or image file against an RKFW image without writing anything.
 pub fn verify_only(image: &Path, source: &str, progress: &mut dyn FnMut(Progress), cancel: &Cancel) -> Result<plan::Plan> {
     let img = RkfwImage::open(image)?;
     let mut t = target::open_readable(source)?;
     let total_sectors = t.size() / 512;
-    let plan = plan::build(&img, total_sectors)?;
+    // Check the data against the layout the card actually has, so a card that was upgraded (or
+    // whose table a host normalised) verifies as well as a freshly written one.
+    let plan = match read_existing_table(t.as_mut()).and_then(|e| plan::build_upgrade(&img, total_sectors, &e)) {
+        Ok(p) => p,
+        Err(_) => plan::build(&img, total_sectors)?,
+    };
     // The GPT holds random GUIDs, so compare its structure separately and skip its bytes.
     let ops: Vec<plan::Op> = plan.flattened().into_iter().filter(|o| o.step != "GPT" && o.step != "Clear MBR").collect();
     writer::verify_target(&ops, &img, t.as_mut(), progress, cancel)?;
@@ -95,10 +124,10 @@ pub fn check_gpt(plan: &plan::Plan, head: &[u8], t: &mut dyn target::Target) -> 
         bail!("primary GPT entry array CRC is wrong");
     }
     let entries = crate::gpt::parse_entries(array, h.entry_count, h.entry_size);
-    if entries.len() != plan.gpt.entries.len() {
-        bail!("GPT has {} partitions, expected {}", entries.len(), plan.gpt.entries.len());
+    if entries.len() != plan.entries.len() {
+        bail!("GPT has {} partitions, expected {}", entries.len(), plan.entries.len());
     }
-    for (a, b) in entries.iter().zip(plan.gpt.entries.iter()) {
+    for (a, b) in entries.iter().zip(plan.entries.iter()) {
         if a.name != b.name || a.first_lba != b.first_lba || a.last_lba != b.last_lba || a.attributes != b.attributes {
             bail!(
                 "partition {} is {}..{} (attr {:#x}), expected {}..{} (attr {:#x})",

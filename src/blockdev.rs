@@ -85,6 +85,12 @@ mod imp {
 
     impl BlockDevice {
         pub fn open_for_write(path: &str) -> Result<BlockDevice> {
+            Self::open_for_write_ex(path, false)
+        }
+
+        /// `keep_layout` leaves the existing partition table alone (upgrade mode).
+        pub fn open_for_write_ex(path: &str, keep_layout: bool) -> Result<BlockDevice> {
+            let _ = keep_layout;
             crate::disks::prepare_for_write(path)?;
             let file = open_rw(path)?;
             set_nocache(&file);
@@ -381,6 +387,11 @@ mod imp {
 
     impl BlockDevice {
         pub fn open_for_write(path: &str) -> Result<BlockDevice> {
+            Self::open_for_write_ex(path, false)
+        }
+
+        /// `keep_layout` leaves the existing partition table alone (upgrade mode).
+        pub fn open_for_write_ex(path: &str, keep_layout: bool) -> Result<BlockDevice> {
             let disk_number = crate::disks::windows_disk_number(path)
                 .ok_or_else(|| anyhow::anyhow!("{path} is not a \\\\.\\PhysicalDriveN path"))?;
             // Lock and dismount every volume that lives on this disk, and keep the handles so the
@@ -401,7 +412,10 @@ mod imp {
             let handle = open_raw(path, true)?;
             let size = disk_length(handle)?;
             // Drop the stale partition layout so Windows does not keep the old volumes around.
-            ioctl_simple(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
+            // An upgrade keeps the table the card already has, so it must not be deleted.
+            if !keep_layout {
+                ioctl_simple(handle, IOCTL_DISK_DELETE_DRIVE_LAYOUT);
+            }
             Ok(BlockDevice { path: path.to_string(), handle, volumes, size, writable: true })
         }
 

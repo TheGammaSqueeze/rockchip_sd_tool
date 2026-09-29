@@ -151,6 +151,7 @@ struct Job {
     started: Instant,
     target_desc: String,
     is_device: bool,
+    is_upgrade: bool,
 }
 
 #[derive(PartialEq)]
@@ -165,6 +166,7 @@ struct App {
     image_error: Option<String>,
     storage: Option<Storage>,
     verify: bool,
+    upgrade: bool,
     popup: Popup,
     disks: Vec<DiskInfo>,
     disks_refreshed: Instant,
@@ -191,6 +193,7 @@ impl App {
             image_error: None,
             storage: None,
             verify: true,
+            upgrade: false,
             popup: Popup::None,
             disks: disks::list(),
             disks_refreshed: Instant::now(),
@@ -243,7 +246,16 @@ impl App {
             Storage::Device(d) => (d.path.clone(), None, true),
             Storage::File { path, size } => (path.to_string_lossy().to_string(), Some(*size), false),
         };
-        let spec = JobSpec { image: img.path.clone(), output, size, verify: self.verify, xz_level: 3, verify_blocks: true };
+        let size = if self.upgrade { None } else { size };
+        let spec = JobSpec {
+            image: img.path.clone(),
+            output,
+            size,
+            verify: self.verify,
+            xz_level: 3,
+            verify_blocks: true,
+            upgrade: self.upgrade,
+        };
         let target_desc = storage.label();
         let use_helper = is_device && elevate::needs_helper();
         let handle = if use_helper {
@@ -290,6 +302,7 @@ impl App {
             started: Instant::now(),
             target_desc,
             is_device,
+            is_upgrade: self.upgrade,
         });
     }
 
@@ -358,15 +371,17 @@ impl App {
         if let Some(r) = finished {
             let elapsed = job.started.elapsed();
             let is_device = job.is_device;
+            let was_upgrade = job.is_upgrade;
             let desc = job.target_desc.clone();
             self.job = None;
             self.outcome = Some(match r {
                 Ok(()) => (
                     true,
-                    if is_device {
-                        format!("Write successful. {} is ready; you can remove the card now. ({})", desc, fmt_dur(elapsed))
-                    } else {
-                        format!("Image written to {}. ({})", desc, fmt_dur(elapsed))
+                    match (is_device, was_upgrade) {
+                        (true, true) => format!("Upgrade successful. {} is ready and its user data was kept; you can remove the card now. ({})", desc, fmt_dur(elapsed)),
+                        (true, false) => format!("Write successful. {} is ready; you can remove the card now. ({})", desc, fmt_dur(elapsed)),
+                        (false, true) => format!("{} upgraded. ({})", desc, fmt_dur(elapsed)),
+                        (false, false) => format!("Image written to {}. ({})", desc, fmt_dur(elapsed)),
                     },
                 ),
                 Err(e) => (false, format!("{e:#}")),
@@ -478,7 +493,7 @@ impl eframe::App for App {
                         self.popup = Popup::Storage;
                     }
                     if let (Some(s), Some(i)) = (&self.storage, &self.image) {
-                        if s.size() < i.min_bytes {
+                        if !self.upgrade && s.size() < i.min_bytes {
                             ui.add_space(4.0);
                             ui.label(RichText::new(format!("too small: {} available, {} needed", human_bytes(s.size()), human_bytes(i.min_bytes))).small().color(ACCENT));
                         }
@@ -488,8 +503,14 @@ impl eframe::App for App {
                 cols[2].vertical_centered(|ui| {
                     ui.label(RichText::new("Write").strong().size(15.0));
                     ui.add_space(6.0);
+                    // An upgrade uses the card's own size and layout, so the size of a chosen
+                    // image file says nothing about whether it fits.
                     let ready = self.image.is_some()
-                        && self.storage.as_ref().map(|s| s.size() >= self.image.as_ref().unwrap().min_bytes).unwrap_or(false);
+                        && self
+                            .storage
+                            .as_ref()
+                            .map(|s| self.upgrade || s.size() >= self.image.as_ref().unwrap().min_bytes)
+                            .unwrap_or(false);
                     if busy {
                         if ui.add(big_button("CANCEL")).clicked() {
                             self.cancel_job();
@@ -504,6 +525,10 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     ui.add_enabled(!busy, egui::Checkbox::new(&mut self.verify, "Verify after writing"))
                         .on_hover_text("Every block is already read back and compared right after it is written (and rewritten up to 3 times on mismatch). This adds a second full pass over the card at the end.");
+                    ui.add_enabled(!busy, egui::Checkbox::new(&mut self.upgrade, "Upgrade, keep user data"))
+                        .on_hover_text(
+                            "Writes the loader and every partition this image carries onto a card that already has the same layout, and leaves the partition table and everything else, including user data, untouched. The write stops before it starts if the card's layout does not match.",
+                        );
                 });
             });
 
@@ -514,7 +539,7 @@ impl eframe::App for App {
             if let Some(job) = &self.job {
                 let p = &job.progress;
                 let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-                let phase = if p.phase == "verify" { "Verifying" } else { "Writing" };
+                let phase = if p.phase == "verify" { "Verifying" } else if job.is_upgrade { "Upgrading" } else { "Writing" };
                 ui.label(RichText::new(format!("{phase} {} to {}", p.step, job.target_desc)).strong());
                 ui.add(egui::ProgressBar::new(frac).show_percentage().animate(true));
                 let elapsed = job.started.elapsed().as_secs_f64();
@@ -655,13 +680,19 @@ impl App {
         };
         let mut open = true;
         let mut decided = None;
-        egui::Window::new("Erase and write?")
+        let title = if self.upgrade { "Upgrade this card?" } else { "Erase and write?" };
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
+                if self.upgrade {
+                    ui.label(RichText::new(format!("Every partition this image carries will be replaced on {}.", d.label())).strong());
+                    ui.label("The partition table and user data are kept. The card must already have this image's layout; it is checked before anything is written.");
+                } else {
+                    ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
+                }
                 if !d.mounts.is_empty() {
                     ui.label(format!("It is currently mounted at {}; it will be unmounted first.", d.mounts.join(", ")));
                 }
@@ -673,7 +704,8 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(RichText::new("Yes, erase and write").color(Color32::WHITE)).fill(ACCENT)).clicked() {
+                    let go = if self.upgrade { "Yes, upgrade" } else { "Yes, erase and write" };
+                    if ui.add(egui::Button::new(RichText::new(go).color(Color32::WHITE)).fill(ACCENT)).clicked() {
                         decided = Some(true);
                     }
                     if ui.button("No").clicked() {

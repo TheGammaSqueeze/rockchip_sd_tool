@@ -68,6 +68,9 @@ pub fn helper_args(spec: &crate::job::JobSpec, progress_file: &Path) -> Vec<Stri
     if !spec.verify_blocks {
         a.push("--no-block-verify".into());
     }
+    if spec.upgrade {
+        a.push("--upgrade".into());
+    }
     a
 }
 

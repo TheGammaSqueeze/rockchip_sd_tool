@@ -279,6 +279,34 @@ pub fn parse_entries(array: &[u8], count: u32, size: u32) -> Vec<GptEntry> {
     v
 }
 
+/// Reads and validates the partition table of a card: the protective MBR, the primary header and
+/// its entry array. Returns the partitions in table order.
+pub fn read_table(head: &[u8]) -> Result<(ParsedHeader, Vec<GptEntry>)> {
+    if head.len() < 34 * SECTOR as usize {
+        bail!("need the first 34 sectors to read a partition table");
+    }
+    if head[0x1fe] != 0x55 || head[0x1ff] != 0xaa || head[0x1be + 4] != 0xee {
+        bail!("the card has no GPT (no protective MBR)");
+    }
+    let h = parse_header(&head[512..1024])?;
+    if !h.header_crc_ok {
+        bail!("the card's GPT header is damaged (CRC mismatch)");
+    }
+    if h.entry_size < ENTRY_SIZE as u32 || h.entry_count == 0 || h.entry_count > 256 {
+        bail!("the card's GPT has {} entries of {} bytes", h.entry_count, h.entry_size);
+    }
+    let len = (h.entry_count * h.entry_size) as usize;
+    if 1024 + len > head.len() {
+        bail!("the card's GPT entry array does not fit in the first 34 sectors");
+    }
+    let array = &head[1024..1024 + len];
+    if crc32fast::hash(array) != h.array_crc {
+        bail!("the card's GPT entry array is damaged (CRC mismatch)");
+    }
+    let entries = parse_entries(array, h.entry_count, h.entry_size);
+    Ok((h, entries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

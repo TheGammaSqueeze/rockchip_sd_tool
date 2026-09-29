@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0
+
+- New **Upgrade, keep user data** option (`--upgrade`): re-flash a card that already has this
+  layout without losing what is on it. The loader and every partition the image carries are
+  replaced; the partition table is kept as it is, nothing is resized, and the partitions the
+  image does not carry, `userdata` above all, are untouched. The card's table is checked
+  against the image's layout first, and a card that does not match is refused before anything
+  is written. Raw `.img` files can be upgraded in place too.
+
 ## 1.0.2
 
 - macOS: the program no longer runs a root helper. The raw disk is opened through the

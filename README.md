@@ -51,7 +51,9 @@ pass the image path as the only argument, or drag an image file onto the window.
    internal disks are hidden unless you ask for them and the system disk is never
    selectable). Or switch to *Image file* and write to a `.img` / `.img.xz` for a
    card of a chosen size.
-3. **Write**. On Linux you are asked for your password (a root helper does the raw disk
+3. **Write**. Tick **Upgrade, keep user data** first if you are re-flashing a card that
+   already runs this firmware and want to keep what is on it (see below). On Linux you are
+   asked for your password (a root helper does the raw disk
    writing); on macOS the system asks for the administrator password to open the disk,
    like Raspberry Pi Imager, and the program itself keeps running as you; on Windows the
    program asks for administrator rights when it starts.
@@ -60,6 +62,22 @@ Every block is flushed to the card, read back and compared right after it is
 written; a block that reads back wrong is rewritten, up to three attempts, after
 which the write fails with the sector number (bad or counterfeit cards). The
 "Verify after writing" option adds a second full read-back pass at the end.
+
+### Upgrading a card without losing user data
+
+**Upgrade, keep user data** (`--upgrade` on the command line) re-flashes a card that already
+has this layout: the loader and every partition the image carries (uboot, misc, dtbo, vbmeta,
+boot, recovery, baseparameter, super) are replaced, and everything else is left exactly as it
+is. The partition table is not rewritten, nothing is resized, and the partitions the image does
+not carry, `userdata` above all, keep their contents.
+
+Before the first byte is written the card's own partition table is read and compared with the
+image's parameter file: every partition must be present, at the same sector, with the same size,
+except the growing partition (`userdata`), whose size follows the card it was made on. If
+anything differs the write is refused and the card is left untouched, with a message naming the
+partition that does not match. Write such a card in full instead.
+
+A raw `.img` file can be upgraded in place the same way; a compressed `.img.xz` cannot.
 
 ### Command line
 
@@ -71,6 +89,7 @@ rockchip_sd_tool write <image.img> --to /dev/rdisk4          (macOS, needs sudo)
 rockchip_sd_tool write <image.img> --to \\.\PhysicalDrive2   (Windows, admin prompt)
 rockchip_sd_tool write <image.img> --to card.img.xz --size 128GB
 rockchip_sd_tool write <image.img> --to card.img --size 250347520s
+rockchip_sd_tool write <image.img> --to /dev/sdX --upgrade    (keep the table and user data)
 rockchip_sd_tool verify <image.img> --from /dev/sdX
 ```
 
@@ -83,8 +102,9 @@ of an all-zero block is reused for every zero block, so a 128 GB card image take
 as long as compressing the firmware itself, and the block index lets `verify` and the
 post-write verification seek instead of decoding the whole file.
 
-Flags: `--no-verify` skips the final full verification pass, `--no-block-verify`
-skips the per-block read-back, `--yes` skips the confirmation for devices,
+Flags: `--upgrade` keeps the partition table and user data (above), `--no-verify` skips the
+final full verification pass, `--no-block-verify` skips the per-block read-back,
+`--yes` skips the confirmation for devices,
 `--xz-level N` sets the xz preset (default 3). On Linux the `write` command needs
 `sudo` for a device; on macOS it asks for the administrator password itself.
 
@@ -132,8 +152,10 @@ Details that matter for a byte-identical result:
 several partitions), writes it to a raw `.img` and to a `.img.xz`, reads both back and
 checks the loader placement and descrambling, every partition, the sparse expansion,
 the primary and backup GPT (CRCs, ranges, attributes, UUID version), the size checks,
-cancellation, and the per-block verification with retries (fault injection: a flaky
-block is rewritten, a permanently bad block fails after three attempts).
+cancellation, the per-block verification with retries (fault injection: a flaky block is
+rewritten, a permanently bad block fails after three attempts), and the upgrade mode (user data
+and the partition table survive, a card with a different layout or no partition table is
+refused without being touched).
 
 ## Safety
 

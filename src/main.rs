@@ -60,6 +60,10 @@ enum Cmd {
         /// right after it is written, and rewritten up to 3 times on mismatch).
         #[arg(long)]
         no_block_verify: bool,
+        /// Upgrade a card that already has this layout: write the loader and every partition the
+        /// image carries, keep the partition table and everything it does not carry (user data).
+        #[arg(long)]
+        upgrade: bool,
         /// Do not ask for confirmation before writing to a device.
         #[arg(short, long)]
         yes: bool,
@@ -174,7 +178,7 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                     for n in &p.notes {
                         println!("  {n}");
                     }
-                    println!("  GPT: {} partitions, last usable sector {}", p.gpt.entries.len(), gpt::last_usable_lba(total));
+                    println!("  GPT: {} partitions, last usable sector {}", p.entries.len(), gpt::last_usable_lba(total));
                 }
                 Err(e) => println!("\nPlan for a {} card: {e}", human_bytes(total * 512)),
             }
@@ -207,13 +211,13 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                 println!("no removable disks found{}", if all { "" } else { " (use --all to list every disk)" });
             }
         }
-        Cmd::Write { image, to, size, no_verify, no_block_verify, yes, xz_level, progress_file } => {
+        Cmd::Write { image, to, size, no_verify, no_block_verify, upgrade, yes, xz_level, progress_file } => {
             let is_dev = disks::is_block_device_path(&to);
             let size_bytes = match &size {
                 Some(s) => Some(parse_size(s).ok_or_else(|| anyhow::anyhow!("bad size '{s}'"))?),
                 None => None,
             };
-            if !is_dev && size_bytes.is_none() {
+            if !is_dev && size_bytes.is_none() && !upgrade {
                 bail!("--size is required when writing to a file (the size of the SD card the image is for)");
             }
             if is_dev {
@@ -225,10 +229,14 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                         bail!("{to} is the system disk; refusing to write to it");
                     }
                     if !yes {
-                        eprintln!("About to ERASE {} ({}, {}) and write {}.", d.path, d.model, human_bytes(d.size), image.display());
+                        if upgrade {
+                            eprintln!("About to UPGRADE {} ({}, {}) from {}: every partition the image carries is replaced, the partition table and user data are kept.", d.path, d.model, human_bytes(d.size), image.display());
+                        } else {
+                            eprintln!("About to ERASE {} ({}, {}) and write {}.", d.path, d.model, human_bytes(d.size), image.display());
+                        }
                     }
                 } else if !yes {
-                    eprintln!("About to ERASE {} and write {}.", to, image.display());
+                    eprintln!("About to {} {} with {}.", if upgrade { "UPGRADE" } else { "ERASE" }, to, image.display());
                 }
                 if !yes {
                     eprint!("Type 'yes' to continue: ");
@@ -239,7 +247,7 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                     }
                 }
             }
-            let spec = JobSpec { image, output: to, size: size_bytes, verify: !no_verify, xz_level, verify_blocks: !no_block_verify };
+            let spec = JobSpec { image, output: to, size: size_bytes, verify: !no_verify, xz_level, verify_blocks: !no_block_verify, upgrade };
             let cancel = Cancel::new();
             let mut pf = match &progress_file {
                 Some(p) => Some(std::fs::File::create(p).with_context(|| format!("cannot create {}", p.display()))?),
