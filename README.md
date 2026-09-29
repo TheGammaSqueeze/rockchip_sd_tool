@@ -13,6 +13,29 @@ with any image writer.
 The GUI follows the Raspberry Pi Imager flow: choose image, choose storage, write.
 A command line interface is included for scripting.
 
+![The main window with a firmware image chosen](assets/screenshots/01-main.png)
+
+What it does:
+
+* writes the SD Boot layout of an RKFW image to a card, byte for byte what SDDiskTool v1.69
+  produces (loader, every partition the image carries, GPT);
+* **upgrades** a card that already has that layout without touching the partition table or
+  user data, so a firmware update keeps saves and settings;
+* writes the same card image to a raw `.img` or a compressed `.img.xz` for a card size you
+  choose, instead of to a card;
+* reads every block back as it writes it and rewrites the ones that come back wrong, then
+  verifies the whole card, because cheap and counterfeit cards are common;
+* runs on Windows, macOS and Linux from one small self-contained binary.
+
+## Screenshots
+
+| | |
+| --- | --- |
+| **Choose the card.** Only removable disks are listed; the system disk is never selectable. <br> ![Choosing the card](assets/screenshots/02-choose-card.png) | **Or write to a file.** Pick the size of the card the image is meant for and write a `.img` or `.img.xz`. <br> ![Writing to an image file](assets/screenshots/03-image-file.png) |
+| **Confirm.** A full write says plainly that the card will be erased. <br> ![Confirming a full write](assets/screenshots/04-confirm.png) | **Writing.** Progress per partition, with the speed and the number of blocks that had to be rewritten. <br> ![Writing in progress](assets/screenshots/05-writing.png) |
+| **Done.** The card is verified before it is released. <br> ![Write finished](assets/screenshots/06-done.png) | **Upgrade instead.** With *Upgrade, keep user data* ticked, the same button re-flashes the partitions and keeps everything else. <br> ![Confirming an upgrade](assets/screenshots/07-upgrade-confirm.png) |
+| **Upgrade done.** The partition table and user data are still there. <br> ![Upgrade finished](assets/screenshots/08-upgrade-done.png) | |
+
 ## Download and build
 
 Prebuilt binaries for Windows, macOS (Intel and Apple silicon) and Linux (x86_64 and
@@ -50,7 +73,7 @@ pass the image path as the only argument, or drag an image file onto the window.
 2. **Choose storage**: pick the SD card (only removable USB/SD disks are listed;
    internal disks are hidden unless you ask for them and the system disk is never
    selectable). Or switch to *Image file* and write to a `.img` / `.img.xz` for a
-   card of a chosen size.
+   card of a chosen size. See the screenshots above.
 3. **Write**. Tick **Upgrade, keep user data** first if you are re-flashing a card that
    already runs this firmware and want to keep what is on it (see below). On Linux you are
    asked for your password (a root helper does the raw disk
@@ -78,6 +101,8 @@ anything differs the write is refused and the card is left untouched, with a mes
 partition that does not match. Write such a card in full instead.
 
 A raw `.img` file can be upgraded in place the same way; a compressed `.img.xz` cannot.
+
+The screenshots above show the confirmation and the result of an upgrade.
 
 ### Command line
 
