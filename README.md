@@ -89,10 +89,22 @@ which the write fails with the sector number (bad or counterfeit cards). The
 ### Upgrading a card without losing user data
 
 **Upgrade, keep user data** (`--upgrade` on the command line) re-flashes a card that already
-has this layout: the loader and every partition the image carries (uboot, misc, dtbo, vbmeta,
-boot, recovery, baseparameter, super) are replaced, and everything else is left exactly as it
-is. The partition table is not rewritten, nothing is resized, and the partitions the image does
-not carry, `userdata` above all, keep their contents.
+has this layout: the loader and the firmware partitions (`uboot`, `dtbo`, `vbmeta`, `boot`,
+`recovery`, `baseparameter`, `super`) are replaced, and everything else is left exactly as it
+is. The partition table is not rewritten and nothing is resized.
+
+These partitions are never written by an upgrade, even when the image carries them:
+`misc`, `cache`, `metadata`, `frp`, `swap`, `backup` and `userdata`. They hold the state of the
+device rather than firmware, and writing them is what a factory flash does:
+
+* `misc` is the bootloader control block. Rockchip firmware ships it with the command
+  `boot-recovery` and the recovery argument `--wipe_all`, which is how a freshly written card
+  wipes itself on its first boot. Giving that to a card that is already in use erases exactly
+  what the upgrade is meant to keep.
+* `metadata` holds the keys user data is encrypted with, so replacing it makes the existing user
+  data unreadable.
+
+A full write still writes all of them, because that is what makes a new card set itself up.
 
 Before the first byte is written the card's own partition table is read and compared with the
 image's parameter file: every partition must be present, at the same sector, with the same size,

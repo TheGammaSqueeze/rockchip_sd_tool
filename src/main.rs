@@ -60,8 +60,9 @@ enum Cmd {
         /// right after it is written, and rewritten up to 3 times on mismatch).
         #[arg(long)]
         no_block_verify: bool,
-        /// Upgrade a card that already has this layout: write the loader and every partition the
-        /// image carries, keep the partition table and everything it does not carry (user data).
+        /// Upgrade a card that already has this layout: write the loader and the firmware
+        /// partitions, keep the partition table, user data and the device's own state (misc,
+        /// cache, metadata).
         #[arg(long)]
         upgrade: bool,
         /// Do not ask for confirmation before writing to a device.
@@ -230,7 +231,7 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                     }
                     if !yes {
                         if upgrade {
-                            eprintln!("About to UPGRADE {} ({}, {}) from {}: every partition the image carries is replaced, the partition table and user data are kept.", d.path, d.model, human_bytes(d.size), image.display());
+                            eprintln!("About to UPGRADE {} ({}, {}) from {}: the firmware partitions are replaced; the partition table, user data and the device's own state (misc, cache, metadata) are kept.", d.path, d.model, human_bytes(d.size), image.display());
                         } else {
                             eprintln!("About to ERASE {} ({}, {}) and write {}.", d.path, d.model, human_bytes(d.size), image.display());
                         }

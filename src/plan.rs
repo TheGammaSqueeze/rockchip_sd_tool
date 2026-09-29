@@ -25,6 +25,24 @@ pub const SECTOR: u64 = 512;
 /// Where the loader goes (SDDiskTool `IDBLOCK_POS`, default 64).
 pub const IDBLOCK_POS: u64 = 64;
 
+/// Partitions an upgrade never writes, because they hold the state of the device rather than
+/// firmware. Writing them from the image is what a factory flash does, and it is exactly what
+/// destroys what an upgrade is meant to keep:
+///
+/// * `misc` carries the bootloader control block. Rockchip firmware ships it with the command
+///   `boot-recovery` and the recovery argument `--wipe_all`, so a device that is given the
+///   image's `misc` wipes user data on its next boot. This is intended for a factory flash and
+///   must not happen during an upgrade.
+/// * `metadata` holds the keys that user data is encrypted with; replacing it makes the existing
+///   user data unreadable, which is a wipe in all but name.
+/// * `cache`, `frp`, `swap`, `backup` and `userdata` are scratch or user state as well.
+pub const UPGRADE_KEEPS: &[&str] = &["misc", "cache", "metadata", "userdata", "frp", "swap", "backup"];
+
+/// True when an upgrade must leave this partition alone.
+pub fn upgrade_keeps(name: &str) -> bool {
+    UPGRADE_KEEPS.iter().any(|k| k.eq_ignore_ascii_case(name))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Zeros.
@@ -212,7 +230,10 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
     if mode == Mode::Full {
         ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
     } else {
-        notes.push("upgrade: the partition table and every partition the image does not carry (user data) are left untouched".into());
+        notes.push(
+            "upgrade: the partition table, user data and the device's own state (misc, cache, metadata) are left untouched"
+                .into(),
+        );
     }
 
     // 2. Loader.
@@ -250,6 +271,10 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
         }
         if item.name.eq_ignore_ascii_case("parameter") {
             // GPT layouts get their table from the GPT step; the parameter item is not written.
+            continue;
+        }
+        if mode == Mode::Upgrade && upgrade_keeps(&item.name) {
+            notes.push(format!("{}: kept as it is (an upgrade does not write it)", item.name));
             continue;
         }
         let start = item.nand_addr as u64;

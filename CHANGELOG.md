@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.1
+
+- **Upgrade no longer resets the device.** An upgrade was writing the image's `misc`
+  partition, which Rockchip firmware ships with the bootloader command `boot-recovery` and
+  the recovery argument `--wipe_all`; the device acted on it at the next boot and wiped the
+  user data the upgrade was meant to keep. An upgrade now leaves `misc` alone, along with
+  `cache`, `metadata`, `frp`, `swap`, `backup` and `userdata`: state that belongs to the
+  device, not to the firmware. A full write is unchanged and still writes them, which is what
+  makes a new card set itself up.
+- Anyone who upgraded a card with 1.1.0 should use 1.1.1 from now on; 1.1.0 upgrades wiped
+  user data on the following boot.
+
 ## 1.1.0
 
 - New **Upgrade, keep user data** option (`--upgrade`): re-flash a card that already has this

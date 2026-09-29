@@ -527,7 +527,7 @@ impl eframe::App for App {
                         .on_hover_text("Every block is already read back and compared right after it is written (and rewritten up to 3 times on mismatch). This adds a second full pass over the card at the end.");
                     ui.add_enabled(!busy, egui::Checkbox::new(&mut self.upgrade, "Upgrade, keep user data"))
                         .on_hover_text(
-                            "Writes the loader and every partition this image carries onto a card that already has the same layout, and leaves the partition table and everything else, including user data, untouched. The write stops before it starts if the card's layout does not match.",
+                            "Writes the loader and the firmware partitions of this image onto a card that already has the same layout, and leaves the partition table, user data and the device's own state (misc, cache, metadata) untouched. The write stops before it starts if the card's layout does not match.",
                         );
                 });
             });
@@ -689,7 +689,7 @@ impl App {
             .show(ctx, |ui| {
                 if self.upgrade {
                     ui.label(RichText::new(format!("Every partition this image carries will be replaced on {}.", d.label())).strong());
-                    ui.label("The partition table and user data are kept. The card must already have this image's layout; it is checked before anything is written.");
+                    ui.label("The partition table, user data and the device's own state (misc, cache, metadata) are kept. The card must already have this image's layout; it is checked before anything is written.");
                 } else {
                     ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
                 }

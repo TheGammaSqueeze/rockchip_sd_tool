@@ -198,6 +198,11 @@ fn padded(d: &[u8], to: usize) -> Vec<u8> {
 }
 
 fn check_card(path: &PathBuf, total_sectors: u64, fx: &Fixture) {
+    check_card_ex(path, total_sectors, fx, true)
+}
+
+/// `misc_from_image` is false after an upgrade, which leaves the device's own state alone.
+fn check_card_ex(path: &PathBuf, total_sectors: u64, fx: &Fixture, misc_from_image: bool) {
     let mut r = rockchip_sd_tool::target::open_readable(&path.to_string_lossy()).unwrap();
     assert_eq!(r.size(), total_sectors * 512);
     let r = r.as_mut();
@@ -235,7 +240,9 @@ fn check_card(path: &PathBuf, total_sectors: u64, fx: &Fixture) {
     assert!(boot_on_card[fx.boot.len()..].iter().all(|&b| b == 0));
     // Partitions.
     assert_eq!(read_sectors(r, 0x2000, 0x400), fx.uboot);
-    assert_eq!(read_sectors(r, 0x2400, 6), padded(&fx.misc, 512));
+    if misc_from_image {
+        assert_eq!(read_sectors(r, 0x2400, 6), padded(&fx.misc, 512));
+    }
     assert_eq!(read_sectors(r, 0x2500, 0x800), padded(&fx.boot_img, 512));
     // Sparse super: raw, zeros, fill, zeros.
     let hdr = sparse::SparseHeader::parse(&fx.super_sparse).unwrap();
@@ -446,12 +453,19 @@ fn upgrade_keeps_user_data_and_the_partition_table() {
     // everything the image does not carry, above all the user data.
     let table_before = std::fs::read(&out).unwrap()[..34 * 512].to_vec();
     let userdata_at = 0x3d00u64 * 512;
+    let misc_at = 0x2400u64 * 512;
     let marker: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 253) as u8).collect();
+    // The device's own bootloader control block, as it looks once the device has consumed the
+    // factory command. Writing the image's misc over this is what tells the bootloader to enter
+    // recovery and wipe the card, so an upgrade must leave it alone.
+    let misc_state: Vec<u8> = (0..3000u32).map(|i| (i % 97) as u8).collect();
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new().write(true).open(&out).unwrap();
         f.seek(SeekFrom::Start(userdata_at)).unwrap();
         f.write_all(&marker).unwrap();
+        f.seek(SeekFrom::Start(misc_at)).unwrap();
+        f.write_all(&misc_state).unwrap();
         // Something in a partition the image does carry, to prove it is rewritten.
         f.seek(SeekFrom::Start(0x2500 * 512)).unwrap();
         f.write_all(&[0xa5u8; 4096]).unwrap();
@@ -462,12 +476,18 @@ fn upgrade_keeps_user_data_and_the_partition_table() {
     assert_eq!(plan.mode, rockchip_sd_tool::plan::Mode::Upgrade);
     assert!(plan.gpt.is_none(), "an upgrade writes no partition table");
     assert!(plan.ops.iter().all(|o| o.step != "GPT" && o.step != "Clear MBR"));
+    assert!(plan.ops.iter().all(|o| o.step != "misc"), "an upgrade must not write misc");
 
     let after = std::fs::read(&out).unwrap();
     assert_eq!(&after[..34 * 512], &table_before[..], "the partition table must be untouched");
     assert_eq!(&after[userdata_at as usize..userdata_at as usize + marker.len()], &marker[..], "user data must be untouched");
-    // Every partition the image carries is back to the image contents.
-    check_card(&out, total_sectors, &fx);
+    assert_eq!(
+        &after[misc_at as usize..misc_at as usize + misc_state.len()],
+        &misc_state[..],
+        "misc carries the boot-recovery/wipe command in the image, so an upgrade must not write it"
+    );
+    // Every firmware partition is back to the image contents.
+    check_card_ex(&out, total_sectors, &fx, false);
 }
 
 #[test]
@@ -496,4 +516,23 @@ fn upgrade_refuses_a_card_without_a_partition_table() {
     let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: None, verify: false, xz_level: 1, verify_blocks: true, upgrade: true };
     let err = job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap_err();
     assert!(format!("{err:#}").contains("no GPT"), "{err:#}");
+}
+
+#[test]
+fn a_full_write_still_writes_misc() {
+    // The factory flash does write misc: that is what makes a fresh card run the vendor's
+    // first-boot recovery step. Only an upgrade leaves it alone.
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    let full = plan::build(&img, 0x20000).unwrap();
+    assert!(full.ops.iter().any(|o| o.step == "misc"));
+    let entries = full.gpt.as_ref().unwrap().entries.clone();
+    let upgrade = plan::build_upgrade(&img, 0x20000, &entries).unwrap();
+    assert!(upgrade.ops.iter().all(|o| o.step != "misc"));
+    for kept in ["misc", "cache", "metadata", "userdata", "frp", "swap", "backup"] {
+        assert!(rockchip_sd_tool::plan::upgrade_keeps(kept));
+    }
+    for written in ["uboot", "boot", "recovery", "super", "dtbo", "vbmeta", "baseparameter"] {
+        assert!(!rockchip_sd_tool::plan::upgrade_keeps(written));
+    }
 }
