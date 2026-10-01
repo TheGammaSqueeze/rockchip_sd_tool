@@ -43,6 +43,24 @@ pub fn upgrade_keeps(name: &str) -> bool {
     UPGRADE_KEEPS.iter().any(|k| k.eq_ignore_ascii_case(name))
 }
 
+/// Partitions whose filesystem signature a full write clears, so the device formats them itself.
+///
+/// The firmware carries no image for them, so a card keeps whatever the previous owner of those
+/// sectors left behind. Android is meant to be handed a blank one: `metadata` holds the keys
+/// `userdata` is encrypted with, and the pair only works when both are made together. The vendor
+/// arranges that by asking recovery to wipe on the first boot, but a device that never reaches
+/// recovery, or reaches it without a command, is then left with a half-made filesystem it cannot
+/// repair, which is a card that boots to the recovery menu and stays there.
+///
+/// Clearing the signature costs a few megabytes and makes the first boot deterministic: the
+/// filesystems are absent, so Android creates them whether or not the recovery wipe runs.
+pub const ERASE_ON_FULL_WRITE: &[&str] = &["metadata", "cache", "userdata"];
+
+/// How much of each of those partitions is cleared. A filesystem's primary superblock lives in
+/// the first few kilobytes (f2fs at 1 KiB, ext4 at 1 KiB); four megabytes covers those and their
+/// nearby copies without writing anything substantial.
+pub const ERASE_BYTES: u64 = 4 << 20;
+
 /// Size of one Android bootloader control block (`bootloader_message`).
 pub const BCB_SIZE: usize = 2048;
 /// The two places a bootloader control block can live in a Rockchip `misc` partition: Google's
@@ -426,6 +444,23 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
             }
             ops.push(Op { step: item.name.clone(), sector: start, sectors: n, source: Source::File { offset: item.offset, len: item.size } });
             notes.push(format!("{}: {} at sector {}", item.name, crate::util::human_bytes(item.size), start));
+        }
+    }
+
+    // 3a. Clear the filesystem signatures of the partitions the image does not carry, so the
+    // device can make them itself and does not depend on the first-boot recovery wipe.
+    if mode == Mode::Full {
+        for name in ERASE_ON_FULL_WRITE {
+            let Some(e) = entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)) else { continue };
+            let sectors = std::cmp::min(ERASE_BYTES / SECTOR, e.sectors());
+            if sectors == 0 {
+                continue;
+            }
+            ops.push(Op { step: (*name).to_string(), sector: e.first_lba, sectors, source: Source::Zero });
+            notes.push(format!(
+                "{name}: clearing the first {} so the device makes the filesystem itself",
+                crate::util::human_bytes(sectors * SECTOR)
+            ));
         }
     }
 

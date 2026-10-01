@@ -159,6 +159,7 @@ against a card it produced (an RG DS Plus running from that card).
 | 68 | loader: `FlashData` (DDR init), padded to 4 sectors |
 | 68 + data | loader: `FlashBoot` (miniloader), padded to 4 sectors |
 | partition offsets from `parameter.txt` | every firmware item that has a partition address, in table order; Android sparse images are expanded (the unpacked extent and the last 64 sectors of the partition are zeroed first, DONT_CARE chunks stay zero) |
+| start of `metadata`, `cache`, `userdata` | 4 MiB of zeros each, on a full write only (see below) |
 | total - 33 | backup GPT entries and header |
 
 Details that matter for a byte-identical result:
@@ -191,6 +192,13 @@ Details that matter for a byte-identical result:
   the disk is released. This tool writes `total - 34` from the start, so the header is
   consistent, nothing rewrites it, and the card is byte for byte what the device would
   make of a SDDiskTool card.
+* The firmware has no image for `metadata`, `cache` or `userdata`, so a card would otherwise
+  keep whatever those sectors held before. Android expects them blank: `metadata` holds the keys
+  `userdata` is encrypted with, and the two only work when they are made together. The vendor
+  arranges that by asking recovery to wipe on the first boot, which leaves a device that never
+  reaches recovery with filesystems it cannot repair. A full write therefore clears the first
+  4 MiB of each, so Android makes the filesystems itself whether or not the wipe runs. An
+  upgrade leaves them alone, which is how it keeps user data.
 * Items over 4 GiB use afptool's extension (high 32 bits of offset and size stored
   behind an `H` marker inside the file name field), which is honoured.
 

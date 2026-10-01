@@ -615,3 +615,41 @@ fn misc_is_left_alone_when_the_android_version_is_unknown() {
     assert_ne!(data, fx.misc);
     assert_eq!(rockchip_sd_tool::plan::bcb_offset_for(None), None);
 }
+
+#[test]
+fn a_full_write_clears_the_filesystems_the_device_must_make_itself() {
+    use rockchip_sd_tool::plan::{Source, ERASE_BYTES, ERASE_ON_FULL_WRITE};
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    let full = plan::build(&img, 0x20000).unwrap();
+    // Of the partitions Android has to make for itself, this layout has userdata.
+    let ud = full.entries.iter().find(|e| e.name == "userdata").unwrap().clone();
+    let op = full
+        .ops
+        .iter()
+        .find(|o| o.step == "userdata")
+        .expect("a full write clears the start of userdata");
+    assert_eq!(op.source, Source::Zero);
+    assert_eq!(op.sector, ud.first_lba);
+    assert_eq!(op.sectors, ERASE_BYTES / 512);
+    // Only the start, never the whole partition.
+    assert!(op.sectors < ud.sectors());
+    assert!(ERASE_ON_FULL_WRITE.contains(&"userdata"));
+}
+
+#[test]
+fn an_upgrade_never_clears_those_filesystems() {
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    let full = plan::build(&img, 0x20000).unwrap();
+    let entries = full.gpt.as_ref().unwrap().entries.clone();
+    let upgrade = plan::build_upgrade(&img, 0x20000, &entries).unwrap();
+    for name in rockchip_sd_tool::plan::ERASE_ON_FULL_WRITE {
+        // Only partitions this layout actually has can be cleared.
+        if !entries.iter().any(|e| e.name == *name) {
+            continue;
+        }
+        assert!(full.ops.iter().any(|o| o.step == *name), "a full write clears {name}");
+        assert!(!upgrade.ops.iter().any(|o| o.step == *name), "an upgrade keeps {name}");
+    }
+}

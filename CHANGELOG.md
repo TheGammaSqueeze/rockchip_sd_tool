@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.3
+
+- **A fresh card no longer depends on the first-boot recovery wipe.** The firmware carries no
+  image for `metadata`, `cache` or `userdata`, so a card kept whatever those sectors held
+  before. Android is meant to be handed blank ones: `metadata` holds the keys `userdata` is
+  encrypted with, and the two only work when made together. The vendor arranges that by asking
+  recovery to wipe on the first boot, so a device that never reaches recovery, or reaches it
+  without a command, was left with filesystems it could not repair and sat in the recovery menu.
+  A full write now clears the first 4 MiB of those three partitions, which costs seconds and
+  makes the first boot deterministic: Android creates the filesystems itself whether or not the
+  recovery wipe runs. An upgrade still leaves all three completely alone.
+
 ## 1.1.2
 
 - **A card can no longer get stuck in the recovery menu.** Rockchip firmware ships the `misc`
