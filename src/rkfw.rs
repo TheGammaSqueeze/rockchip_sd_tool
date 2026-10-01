@@ -405,6 +405,24 @@ impl RkfwImage {
         Ok(crate::rkcrc::crc32_rk(&d[..size - 4]) == stored)
     }
 
+    /// The major Android version this firmware is, read from the boot image header exactly as
+    /// the Rockchip bootloader reads it (`os_version` bits 25..31). `None` when the boot item is
+    /// missing or is not an Android boot image.
+    pub fn android_major_version(&self) -> Option<u32> {
+        let item = self.af.item("boot")?;
+        if item.size < 2048 {
+            return None;
+        }
+        let h = self.read_range(item.offset, 48).ok()?;
+        if &h[0..8] != b"ANDROID!" {
+            return None;
+        }
+        let os_version = u32::from_le_bytes(h[44..48].try_into().ok()?);
+        let major = (os_version >> 25) & 0x7f;
+        // 0x7f is the GKI marker, which the bootloader treats as "new enough".
+        Some(major)
+    }
+
     /// Computes the MD5 of the file body and compares it to the stored digest.
     /// Returns Ok(None) when the image carries no digest.
     pub fn check_md5(&self, mut progress: impl FnMut(u64, u64)) -> Result<Option<bool>> {

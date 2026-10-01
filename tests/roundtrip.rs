@@ -132,8 +132,27 @@ fn fixture_param(parameter: &str) -> Fixture {
     let boot = pattern(258048 - 700, 2); // not sector aligned: exercises padding and the
                                           // plain trailing partial sector rule
     let uboot = pattern(0x400 * 512, 3);
-    let misc = pattern(3000, 4);
-    let boot_img = pattern(0x800 * 512 - 100, 5);
+    // A misc image as Rockchip ships it: the same boot command at offset 0 and at 16 KiB.
+    let misc = {
+        let mut m = vec![0u8; 0xc000];
+        for off in [0usize, 0x4000] {
+            m[off..off + 13].copy_from_slice(b"boot-recovery");
+            m[off + 64..off + 64 + 19].copy_from_slice(b"recovery\n--wipe_all");
+        }
+        m
+    };
+    // A boot image with a real Android header, so the bootloader (and this tool) can read the
+    // Android version off it. os_version 0x1c000196 is Android 14.
+    let boot_img = {
+        let mut b = pattern(0x800 * 512 - 100, 5);
+        b[0..8].copy_from_slice(b"ANDROID!");
+        b[8..12].copy_from_slice(&40_000u32.to_le_bytes()); // kernel_size
+        b[16..20].copy_from_slice(&2_000u32.to_le_bytes()); // ramdisk_size
+        b[36..40].copy_from_slice(&2048u32.to_le_bytes()); // page_size
+        b[40..44].copy_from_slice(&2u32.to_le_bytes()); // header_version
+        b[44..48].copy_from_slice(&0x1c00_0196u32.to_le_bytes()); // os_version: Android 14
+        b
+    };
     // super: sparse, 4 KiB blocks, 0x1000 sectors partition = 512 blocks:
     // 3 raw + 100 dont care + 5 fill + 404 dont care.
     let raw = pattern(3 * 4096, 6);
@@ -241,7 +260,11 @@ fn check_card_ex(path: &PathBuf, total_sectors: u64, fx: &Fixture, misc_from_ima
     // Partitions.
     assert_eq!(read_sectors(r, 0x2000, 0x400), fx.uboot);
     if misc_from_image {
-        assert_eq!(read_sectors(r, 0x2400, 6), padded(&fx.misc, 512));
+        // misc is written with only the boot command the bootloader reads: offset 0 here,
+        // because the fixture's boot image says Android 14.
+        let mut expect = fx.misc.clone();
+        rockchip_sd_tool::plan::normalize_misc(&mut expect, rockchip_sd_tool::plan::BCB_OFFSET_GOOGLE);
+        assert_eq!(read_sectors(r, 0x2400, 0x60), expect);
     }
     assert_eq!(read_sectors(r, 0x2500, 0x800), padded(&fx.boot_img, 512));
     // Sparse super: raw, zeros, fill, zeros.
@@ -466,6 +489,9 @@ fn upgrade_keeps_user_data_and_the_partition_table() {
         f.write_all(&marker).unwrap();
         f.seek(SeekFrom::Start(misc_at)).unwrap();
         f.write_all(&misc_state).unwrap();
+        // A stale boot command at the offset the bootloader does not read: the recovery loop.
+        f.seek(SeekFrom::Start(misc_at + 0x4000)).unwrap();
+        f.write_all(b"boot-recovery\0").unwrap();
         // Something in a partition the image does carry, to prove it is rewritten.
         f.seek(SeekFrom::Start(0x2500 * 512)).unwrap();
         f.write_all(&[0xa5u8; 4096]).unwrap();
@@ -476,7 +502,13 @@ fn upgrade_keeps_user_data_and_the_partition_table() {
     assert_eq!(plan.mode, rockchip_sd_tool::plan::Mode::Upgrade);
     assert!(plan.gpt.is_none(), "an upgrade writes no partition table");
     assert!(plan.ops.iter().all(|o| o.step != "GPT" && o.step != "Clear MBR"));
-    assert!(plan.ops.iter().all(|o| o.step != "misc"), "an upgrade must not write misc");
+    // The only thing an upgrade may do to misc is clear the control block the bootloader does
+    // not read; it must never write a command there.
+    for op in plan.ops.iter().filter(|o| o.step == "misc") {
+        assert_eq!(op.source, rockchip_sd_tool::plan::Source::Zero);
+        assert_eq!(op.sector, 0x2400 + 0x4000 / 512, "only the unused control block");
+        assert_eq!(op.sectors, 4);
+    }
 
     let after = std::fs::read(&out).unwrap();
     assert_eq!(&after[..34 * 512], &table_before[..], "the partition table must be untouched");
@@ -485,6 +517,12 @@ fn upgrade_keeps_user_data_and_the_partition_table() {
         &after[misc_at as usize..misc_at as usize + misc_state.len()],
         &misc_state[..],
         "misc carries the boot-recovery/wipe command in the image, so an upgrade must not write it"
+    );
+    // The stale control block the bootloader ignores is cleared, which is what rescues a device
+    // that is looping into recovery.
+    assert!(
+        after[misc_at as usize + 0x4000..misc_at as usize + 0x4800].iter().all(|&b| b == 0),
+        "the unused boot control block must be cleared"
     );
     // Every firmware partition is back to the image contents.
     check_card_ex(&out, total_sectors, &fx, false);
@@ -528,11 +566,52 @@ fn a_full_write_still_writes_misc() {
     assert!(full.ops.iter().any(|o| o.step == "misc"));
     let entries = full.gpt.as_ref().unwrap().entries.clone();
     let upgrade = plan::build_upgrade(&img, 0x20000, &entries).unwrap();
-    assert!(upgrade.ops.iter().all(|o| o.step != "misc"));
+    // An upgrade writes no misc content; the one misc op it may have is zeroing the control
+    // block the bootloader does not read.
+    for op in upgrade.ops.iter().filter(|o| o.step == "misc") {
+        assert_eq!(op.source, rockchip_sd_tool::plan::Source::Zero);
+    }
+    assert!(!upgrade.ops.iter().any(|o| o.step == "misc" && o.source != rockchip_sd_tool::plan::Source::Zero));
     for kept in ["misc", "cache", "metadata", "userdata", "frp", "swap", "backup"] {
         assert!(rockchip_sd_tool::plan::upgrade_keeps(kept));
     }
     for written in ["uboot", "boot", "recovery", "super", "dtbo", "vbmeta", "baseparameter"] {
         assert!(!rockchip_sd_tool::plan::upgrade_keeps(written));
     }
+}
+
+#[test]
+fn the_card_keeps_only_the_boot_command_the_bootloader_reads() {
+    use rockchip_sd_tool::plan::{bcb_has_command, BCB_OFFSET_GOOGLE, BCB_OFFSET_ROCKCHIP};
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    assert_eq!(img.android_major_version(), Some(14));
+    // The image itself carries the command twice, which is the hazard.
+    assert!(bcb_has_command(&fx.misc, BCB_OFFSET_GOOGLE));
+    assert!(bcb_has_command(&fx.misc, BCB_OFFSET_ROCKCHIP));
+
+    let total_sectors = 0x20000u64;
+    let out = fx.dir.path().join("bcb.img");
+    let spec = JobSpec { image: fx.image.clone(), output: out.to_string_lossy().to_string(), size: Some(total_sectors * 512), verify: true, xz_level: 1, verify_blocks: true, upgrade: false };
+    job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap();
+
+    let card = std::fs::read(&out).unwrap();
+    let misc_at = 0x2400usize * 512;
+    let on_card = &card[misc_at..misc_at + 0xc000];
+    assert!(bcb_has_command(on_card, BCB_OFFSET_GOOGLE), "the first-boot command must still be there");
+    assert!(!bcb_has_command(on_card, BCB_OFFSET_ROCKCHIP), "the copy the bootloader ignores must be cleared");
+    assert_eq!(&on_card[..32], &fx.misc[..32], "the command itself is untouched");
+}
+
+#[test]
+fn misc_is_left_alone_when_the_android_version_is_unknown() {
+    // Without a readable Android boot header there is no way to know which control block the
+    // bootloader reads, so the image's misc is written exactly as it is.
+    let fx = fixture_param(PARAMETER);
+    let img = RkfwImage::open(&fx.image).unwrap();
+    assert_eq!(img.android_major_version(), Some(14));
+    let mut data = fx.misc.clone();
+    rockchip_sd_tool::plan::normalize_misc(&mut data, rockchip_sd_tool::plan::BCB_OFFSET_GOOGLE);
+    assert_ne!(data, fx.misc);
+    assert_eq!(rockchip_sd_tool::plan::bcb_offset_for(None), None);
 }

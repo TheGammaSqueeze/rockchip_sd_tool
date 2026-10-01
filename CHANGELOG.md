@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.2
+
+- **A card can no longer get stuck in the recovery menu.** Rockchip firmware ships the `misc`
+  partition with the same boot command ("boot-recovery" with "--wipe_all") written twice: at
+  offset 0, where Google's bootloader convention puts it, and at 16 KiB, where Rockchip's older
+  convention puts it. The bootloader reads whichever one matches the firmware's Android version,
+  but Android's recovery only ever clears the copy at offset 0. A device whose bootloader reads
+  the 16 KiB copy is therefore sent to recovery on every boot while recovery itself finds no
+  command and sits in its menu: a device that never finishes booting and cannot be rescued
+  without rewriting the card.
+  A full write now keeps the boot command only where this firmware's bootloader reads it, using
+  the same rule the bootloader uses (the Android version in the boot image header: offset 0 from
+  Android 10, 16 KiB before that), and clears the other copy.
+- An upgrade now also clears that unused control block, which rescues a card already stuck in
+  the recovery loop without touching user data. It still never writes a boot command, so an
+  upgrade cannot ask a device to wipe itself.
+- Fixed: upgrading a raw `.img` file skipped every range the plan wanted zeroed, on the
+  assumption that the target was blank. That is only true of a file being created for a full
+  write, so an upgrade of an image file could leave stale data where a sparse partition expects
+  zeros. Upgrades now always write their zero ranges. Cards were not affected.
+
 ## 1.1.1
 
 - **Upgrade no longer resets the device.** An upgrade was writing the image's `misc`

@@ -142,7 +142,11 @@ pub fn write_plan(
         );
     }
     let flat = plan.flattened();
-    let skip_zero = target.zero_by_default();
+    // Zero ranges may only be skipped when the target starts out blank, which is true of a file
+    // or stream this tool just created for a full write. An upgrade writes into a card or image
+    // that already holds data, so its zeroing (a sparse image's erase, or clearing a stale boot
+    // command) has to actually happen.
+    let skip_zero = target.zero_by_default() && plan.mode == crate::plan::Mode::Full;
     let ops: Vec<Op> = if target.sequential_only() || skip_zero {
         flat.into_iter().filter(|o| !(skip_zero && matches!(o.source, Source::Zero))).collect()
     } else {

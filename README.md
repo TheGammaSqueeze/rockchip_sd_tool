@@ -93,7 +93,8 @@ has this layout: the loader and the firmware partitions (`uboot`, `dtbo`, `vbmet
 `recovery`, `baseparameter`, `super`) are replaced, and everything else is left exactly as it
 is. The partition table is not rewritten and nothing is resized.
 
-These partitions are never written by an upgrade, even when the image carries them:
+Apart from clearing the stale boot command described further down, these partitions are
+never written by an upgrade, even when the image carries them:
 `misc`, `cache`, `metadata`, `frp`, `swap`, `backup` and `userdata`. They hold the state of the
 device rather than firmware, and writing them is what a factory flash does:
 
@@ -168,8 +169,18 @@ Details that matter for a byte-identical result:
   ROM wants plain data, so each full sector is descrambled; a trailing partial sector
   stays as is.
 * The `parameter` item is not written for GPT layouts; the GPT is built from its
-  `mtdparts` line. `misc` is written verbatim (the "boot-recovery / rk_fwupdate"
-  injection only happens in SDDiskTool's upgrade-card mode).
+  `mtdparts` line.
+* `misc` is written with one deliberate change. Rockchip firmware carries the same boot
+  command ("boot-recovery", "--wipe_all", which is what makes a freshly written card set
+  itself up on its first boot) in two places: offset 0, Google's convention, and 16 KiB,
+  Rockchip's older one. The bootloader reads whichever matches the firmware's Android
+  version, taken from the boot image header, but Android's recovery only ever clears the
+  copy at offset 0. A device whose bootloader reads the 16 KiB copy is sent to recovery on
+  every boot while recovery finds no command and waits in its menu, and the card has to be
+  rewritten to recover. This tool therefore keeps the command only where this firmware's
+  bootloader reads it, by the same rule the bootloader uses, and clears the other copy.
+  An upgrade clears the unused copy too, which frees a card that is already stuck, and it
+  never writes a command.
 * GPT: first usable LBA 34; a `grow` partition ends at `total - 65` on cards of 4 GiB
   and more (`total - 34` below), exactly like SDDiskTool; partition type and unique GUIDs
   are random version 4 UUIDs (a `uuid:name=...` parameter line overrides the unique

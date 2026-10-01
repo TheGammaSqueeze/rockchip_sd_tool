@@ -43,6 +43,46 @@ pub fn upgrade_keeps(name: &str) -> bool {
     UPGRADE_KEEPS.iter().any(|k| k.eq_ignore_ascii_case(name))
 }
 
+/// Size of one Android bootloader control block (`bootloader_message`).
+pub const BCB_SIZE: usize = 2048;
+/// The two places a bootloader control block can live in a Rockchip `misc` partition: Google's
+/// offset 0, and Rockchip's legacy 16 KiB offset.
+pub const BCB_OFFSET_GOOGLE: usize = 0;
+pub const BCB_OFFSET_ROCKCHIP: usize = 0x4000;
+
+/// Where this firmware's bootloader reads the boot command from, by the same rule the Rockchip
+/// bootloader uses: offset 0 from Android 10, the 16 KiB offset before that. `None` when the
+/// Android version cannot be determined, in which case the `misc` image is left as it is.
+pub fn bcb_offset_for(android_major: Option<u32>) -> Option<usize> {
+    match android_major {
+        Some(v) if v >= 10 => Some(BCB_OFFSET_GOOGLE),
+        Some(_) => Some(BCB_OFFSET_ROCKCHIP),
+        None => None,
+    }
+}
+
+/// Removes the boot command from the control block the bootloader does not read.
+///
+/// Rockchip firmware ships `misc` with "boot-recovery" and "--wipe_all" written at **both**
+/// offsets, so that one image suits bootloaders of either convention. On a card that is a
+/// problem: the bootloader acts on one copy, and Android's recovery only ever clears the copy at
+/// offset 0. If the bootloader happens to read the other one, it sends the device to recovery on
+/// every boot while recovery itself finds no command and sits in its menu, which is a device that
+/// never finishes booting and cannot be rescued without rewriting the card.
+///
+/// So only the copy this firmware's bootloader actually reads is kept; the other is cleared.
+pub fn normalize_misc(data: &mut [u8], used: usize) {
+    let unused = if used == BCB_OFFSET_GOOGLE { BCB_OFFSET_ROCKCHIP } else { BCB_OFFSET_GOOGLE };
+    if unused + BCB_SIZE <= data.len() {
+        data[unused..unused + BCB_SIZE].fill(0);
+    }
+}
+
+/// True when `data` carries a boot command at `offset`.
+pub fn bcb_has_command(data: &[u8], offset: usize) -> bool {
+    data.get(offset..offset + 32).map(|c| c[0] != 0).unwrap_or(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Zeros.
@@ -301,6 +341,29 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
                 );
             }
         }
+        // misc carries the boot command. Keep only the copy this firmware's bootloader reads.
+        if item.name.eq_ignore_ascii_case("misc") && item.size as usize >= BCB_OFFSET_ROCKCHIP + BCB_SIZE {
+            if let Some(used) = bcb_offset_for(img.android_major_version()) {
+                let mut data = img.read_range(item.offset, item.size as usize)?;
+                let unused = if used == BCB_OFFSET_GOOGLE { BCB_OFFSET_ROCKCHIP } else { BCB_OFFSET_GOOGLE };
+                let had_stale = bcb_has_command(&data, unused);
+                normalize_misc(&mut data, used);
+                let n = sectors_for(data.len() as u64);
+                if n > part_sectors {
+                    bail!("misc: image ({} sectors) is larger than the partition ({} sectors)", n, part_sectors);
+                }
+                data.resize((n * SECTOR) as usize, 0);
+                ops.push(Op { step: item.name.clone(), sector: start, sectors: n, source: Source::Bytes(data.into()) });
+                notes.push(format!(
+                    "misc: {} at sector {}; the boot command is kept at offset {:#x}{}",
+                    crate::util::human_bytes(item.size),
+                    start,
+                    used,
+                    if had_stale { ", the unused copy is cleared so the device cannot loop into recovery" } else { "" }
+                ));
+                continue;
+            }
+        }
         let head = img.read_range(item.offset, std::cmp::min(item.size, 28) as usize)?;
         if let Some(sh) = SparseHeader::parse(&head) {
             sh.validate()?;
@@ -366,6 +429,26 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
         }
     }
 
+    // 3b. An upgrade does not write misc, but it does clear a stale boot command sitting in the
+    // control block this firmware's bootloader does not read. That stale copy is what leaves a
+    // device looping into recovery, and clearing it is the only way back without a full write.
+    // No command is ever written here, so an upgrade still cannot ask the device to wipe itself.
+    if mode == Mode::Upgrade {
+        if let Some(used) = bcb_offset_for(img.android_major_version()) {
+            let unused = if used == BCB_OFFSET_GOOGLE { BCB_OFFSET_ROCKCHIP } else { BCB_OFFSET_GOOGLE };
+            if let Some(e) = entries.iter().find(|e| e.name.eq_ignore_ascii_case("misc")) {
+                let sectors = (BCB_SIZE as u64) / SECTOR;
+                let sector = e.first_lba + unused as u64 / SECTOR;
+                if sector + sectors <= e.last_lba + 1 {
+                    ops.push(Op { step: "misc".into(), sector, sectors, source: Source::Zero });
+                    notes.push(format!(
+                        "misc: clearing the unused boot control block at offset {unused:#x}; the command at {used:#x} and the rest of misc are untouched"
+                    ));
+                }
+            }
+        }
+    }
+
     // 4. GPT: primary (34 sectors at 0), backup (33 sectors at total - 33).
     if let Some(g) = &gpt_img {
         ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(g.primary.clone().into()) });
@@ -393,6 +476,46 @@ pub fn legacy_idb(data_sectors: u64, boot_sectors: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn misc_with_both_copies() -> Vec<u8> {
+        let mut m = vec![0u8; 0xc000];
+        for off in [BCB_OFFSET_GOOGLE, BCB_OFFSET_ROCKCHIP] {
+            m[off..off + 13].copy_from_slice(b"boot-recovery");
+            m[off + 64..off + 64 + 19].copy_from_slice(b"recovery\n--wipe_all");
+        }
+        m
+    }
+
+    #[test]
+    fn bcb_offset_follows_the_android_version() {
+        assert_eq!(bcb_offset_for(Some(14)), Some(BCB_OFFSET_GOOGLE));
+        assert_eq!(bcb_offset_for(Some(10)), Some(BCB_OFFSET_GOOGLE));
+        assert_eq!(bcb_offset_for(Some(0x7f)), Some(BCB_OFFSET_GOOGLE)); // GKI marker
+        assert_eq!(bcb_offset_for(Some(9)), Some(BCB_OFFSET_ROCKCHIP));
+        assert_eq!(bcb_offset_for(None), None);
+    }
+
+    #[test]
+    fn only_the_used_boot_command_survives() {
+        let mut m = misc_with_both_copies();
+        assert!(bcb_has_command(&m, BCB_OFFSET_GOOGLE) && bcb_has_command(&m, BCB_OFFSET_ROCKCHIP));
+        normalize_misc(&mut m, BCB_OFFSET_GOOGLE);
+        assert!(bcb_has_command(&m, BCB_OFFSET_GOOGLE), "the command the bootloader reads stays");
+        assert!(!bcb_has_command(&m, BCB_OFFSET_ROCKCHIP), "the stale copy is cleared");
+        assert!(m[BCB_OFFSET_ROCKCHIP..BCB_OFFSET_ROCKCHIP + BCB_SIZE].iter().all(|&b| b == 0));
+        // Nothing outside the two control blocks is touched.
+        let mut other = misc_with_both_copies();
+        other[0x9000] = 0xa5;
+        let before = other[0x9000];
+        normalize_misc(&mut other, BCB_OFFSET_GOOGLE);
+        assert_eq!(other[0x9000], before);
+
+        // A pre-Android-10 firmware keeps the 16 KiB copy instead.
+        let mut m = misc_with_both_copies();
+        normalize_misc(&mut m, BCB_OFFSET_ROCKCHIP);
+        assert!(!bcb_has_command(&m, BCB_OFFSET_GOOGLE));
+        assert!(bcb_has_command(&m, BCB_OFFSET_ROCKCHIP));
+    }
 
     fn plan_with(ops: Vec<Op>) -> Plan {
         let p = crate::parameter::Parameter::parse("TYPE: GPT\nCMDLINE:mtdparts=rk29xxnand:0x10@0x40(a),-@0x100(b:grow)\n").unwrap();
