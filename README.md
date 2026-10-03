@@ -156,6 +156,10 @@ GitHub CLI you can confirm that the exact file you downloaded came from this sou
 gh attestation verify rockchip_sd_tool-windows-x86_64-<version>.zip --repo TheGammaSqueeze/rockchip_sd_tool
 ```
 
+Recent versions of the GitHub CLI print nothing when the file checks out and exit with status 0;
+a file that does not match fails with an error. Add `--format json` to see which workflow, tag and
+commit the file was built from.
+
 That is a stronger guarantee than a code signing certificate gives, since it ties the binary to the
 public source and the public build log rather than to a paid-for identity. And because the whole
 source is here, you can always build it yourself with `cargo build --release` and compare.
