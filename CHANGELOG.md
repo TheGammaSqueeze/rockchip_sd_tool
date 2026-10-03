@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0
+
+- New **update card, keep user data** mode (`--update-card --keep-data`, or the fourth entry in
+  the mode list). A plain update card leaves the device wiped, because the firmware's `misc` item
+  carries "boot-recovery" and "recovery\n--wipe_all" and the recovery writes that item onto the
+  device as it is. The new mode clears the two bootloader control blocks inside the `misc` item of
+  the copy carried on the card and recomputes the image's trailing MD5, so the recovery still
+  accepts the firmware, installs every partition as before, and the device comes back up with its
+  user data. Nothing else in the firmware is changed.
+  Only suitable when the new firmware can read the data already on the device.
+
 ## 1.2.0
 
 - New **firmware update card** mode (`--update-card`, or the mode list in the window), which is

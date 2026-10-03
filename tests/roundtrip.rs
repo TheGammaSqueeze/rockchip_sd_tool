@@ -753,3 +753,83 @@ fn an_update_card_needs_room_for_the_firmware() {
     assert!(plan::build_update_card(&img, need / 2).is_err(), "a card half the size must be refused");
     assert!(plan::build_update_card(&img, need + 0x20000).is_ok());
 }
+
+#[test]
+fn a_keep_data_update_card_clears_the_wipe_and_fixes_the_checksum() {
+    use rockchip_sd_tool::plan::{bcb_has_command, Mode, BCB_OFFSET_GOOGLE, BCB_OFFSET_ROCKCHIP, UPDATE_IMAGE_NAME};
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    // The image as shipped asks the device to wipe itself.
+    assert!(bcb_has_command(&fx.misc, BCB_OFFSET_GOOGLE));
+    assert!(bcb_has_command(&fx.misc, BCB_OFFSET_ROCKCHIP));
+    assert!(img.md5_hex.is_some());
+
+    let total_sectors = plan::minimum_sectors_update_card(&img).unwrap() + 0x20000;
+    let out = fx.dir.path().join("keepdata.img");
+    let spec = JobSpec {
+        image: fx.image.clone(),
+        output: out.to_string_lossy().to_string(),
+        size: Some(total_sectors * 512),
+        verify: true,
+        xz_level: 1,
+        verify_blocks: true,
+        mode: Mode::UpdateCardKeepData,
+    };
+    job::run(&spec, &mut |_| {}, &Cancel::new()).unwrap();
+
+    // Pull the firmware back off the card and look at it as the device's recovery would.
+    let card = std::fs::read(&out).unwrap();
+    let part_start = u32::from_le_bytes(card[0x1be + 8..0x1be + 12].try_into().unwrap()) as u64;
+    if !std::process::Command::new("sh").arg("-c").arg("command -v mcopy").output().map(|o| o.status.success()).unwrap_or(false) {
+        return;
+    }
+    let spec_arg = format!("{}@@{}", out.display(), part_start * 512);
+    let back = fx.dir.path().join("carried.img");
+    let st = std::process::Command::new("mcopy")
+        .env("MTOOLS_SKIP_CHECK", "1")
+        .args(["-i", &spec_arg, &format!("::{UPDATE_IMAGE_NAME}"), back.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let carried = RkfwImage::open(&back).unwrap();
+    // It is still a valid container: the checksum was recomputed over the patched contents.
+    assert_eq!(carried.check_md5(|_, _| {}).unwrap(), Some(true), "the checksum must match the patched image");
+    assert_ne!(carried.md5_hex, img.md5_hex, "the checksum must have changed");
+    // And the boot command it would install is gone.
+    let item = carried.af.item("misc").unwrap();
+    let misc = carried.read_range(item.offset, item.size as usize).unwrap();
+    assert!(!bcb_has_command(&misc, BCB_OFFSET_GOOGLE), "the wipe command must be cleared");
+    assert!(!bcb_has_command(&misc, BCB_OFFSET_ROCKCHIP), "the second copy must be cleared too");
+    assert!(misc[..0x4800].iter().all(|&b| b == 0));
+
+    // Nothing else about the firmware changed: every other partition is byte for byte the same.
+    for name in ["uboot", "boot", "recovery", "super"] {
+        let a = img.af.item(name).unwrap();
+        let b = carried.af.item(name).unwrap();
+        assert_eq!(a.size, b.size, "{name} changed size");
+        assert_eq!(
+            img.read_range(a.offset, std::cmp::min(a.size, 65536) as usize).unwrap(),
+            carried.read_range(b.offset, std::cmp::min(b.size, 65536) as usize).unwrap(),
+            "{name} changed"
+        );
+    }
+    assert_eq!(carried.file_size, img.file_size, "the container must stay the same size");
+}
+
+#[test]
+fn a_plain_update_card_still_carries_the_wipe() {
+    use rockchip_sd_tool::plan::{bcb_has_command, Mode, BCB_OFFSET_GOOGLE};
+    let fx = fixture();
+    let img = RkfwImage::open(&fx.image).unwrap();
+    let total = plan::minimum_sectors_update_card(&img).unwrap() + 0x20000;
+    let plain = plan::build_update_card(&img, total).unwrap();
+    let keep = plan::build_update_card_keep_data(&img, total).unwrap();
+    assert_eq!(plain.mode, Mode::UpdateCard);
+    assert_eq!(keep.mode, Mode::UpdateCardKeepData);
+    assert!(Mode::UpdateCardKeepData.keeps_user_data() && !Mode::UpdateCard.keeps_user_data());
+    // The faithful card hands the firmware over untouched.
+    assert!(bcb_has_command(&fx.misc, BCB_OFFSET_GOOGLE));
+    let firmware_ops = |p: &plan::Plan| p.ops.iter().filter(|o| o.step == "firmware file").count();
+    assert!(firmware_ops(&keep) > firmware_ops(&plain), "the patched image is written in several ranges");
+}

@@ -237,7 +237,7 @@ impl App {
     /// How much card the chosen mode needs.
     fn needed_bytes(&self) -> u64 {
         match &self.image {
-            Some(i) if self.mode == Mode::UpdateCard => i.update_card_bytes.unwrap_or(i.min_bytes),
+            Some(i) if self.mode.is_update_card() => i.update_card_bytes.unwrap_or(i.min_bytes),
             Some(i) => i.min_bytes,
             None => 0,
         }
@@ -421,6 +421,7 @@ fn mode_label(m: Mode) -> &'static str {
         Mode::Full => "Boot card (erases all)",
         Mode::Upgrade => "Upgrade, keep user data",
         Mode::UpdateCard => "Firmware update card",
+        Mode::UpdateCardKeepData => "Update card, keep user data",
     }
 }
 
@@ -428,7 +429,8 @@ fn mode_help(m: Mode) -> &'static str {
     match m {
         Mode::Full => "Makes a card the device runs from. Everything on the card is erased.",
         Mode::Upgrade => "Writes the loader and the firmware partitions onto a card that already has this image's layout, and keeps the partition table, user data and the device's own state. The write stops before it starts if the layout does not match.",
-        Mode::UpdateCard => "Makes a card that flashes the device's own internal storage. The device boots from it into recovery, installs the firmware carried on the card, and afterwards runs from its internal storage. The card needs room for the whole firmware file.",
+        Mode::UpdateCard => "Makes a card that flashes the device's own internal storage. The device boots from it into recovery, installs the firmware carried on the card, and afterwards runs from its internal storage. The card needs room for the whole firmware file. As the firmware asks, the device wipes its user data on the boot after installing.",
+        Mode::UpdateCardKeepData => "The same card, with the firmware's own request to wipe removed, so the device keeps its user data across the update. Only safe when the new firmware can use the existing data; the wipe exists for the upgrades where it cannot.",
     }
 }
 
@@ -520,7 +522,7 @@ impl eframe::App for App {
                         self.disks_refreshed = Instant::now();
                         self.popup = Popup::Storage;
                     }
-                    if let (Some(s), Some(i)) = (&self.storage, &self.image) {
+                    if let (Some(s), Some(_i)) = (&self.storage, &self.image) {
                         if self.mode != Mode::Upgrade && s.size() < self.needed_bytes() {
                             ui.add_space(4.0);
                             ui.label(RichText::new(format!("too small: {} available, {} needed", human_bytes(s.size()), human_bytes(self.needed_bytes()))).small().color(ACCENT));
@@ -558,7 +560,7 @@ impl eframe::App for App {
                             .width(190.0)
                             .selected_text(mode_label(self.mode))
                             .show_ui(ui, |ui| {
-                                for m in [Mode::Full, Mode::Upgrade, Mode::UpdateCard] {
+                                for m in [Mode::Full, Mode::Upgrade, Mode::UpdateCard, Mode::UpdateCardKeepData] {
                                     ui.selectable_value(&mut self.mode, m, mode_label(m)).on_hover_text(mode_help(m));
                                 }
                             });
@@ -722,7 +724,7 @@ impl App {
         let mut decided = None;
         let title = match self.mode {
             Mode::Upgrade => "Upgrade this card?",
-            Mode::UpdateCard => "Make a firmware update card?",
+            Mode::UpdateCard | Mode::UpdateCardKeepData => "Make a firmware update card?",
             Mode::Full => "Erase and write?",
         };
         egui::Window::new(title)
@@ -736,9 +738,14 @@ impl App {
                         ui.label(RichText::new(format!("Every partition this image carries will be replaced on {}.", d.label())).strong());
                         ui.label("The partition table, user data and the device's own state (misc, cache, metadata) are kept. The card must already have this image's layout; it is checked before anything is written.");
                     }
-                    Mode::UpdateCard => {
+                    Mode::UpdateCard | Mode::UpdateCardKeepData => {
                         ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
                         ui.label("The card becomes a firmware update card. A device booted from it goes into recovery and flashes its own internal storage from the firmware on the card; the device does not run from the card.");
+                        if self.mode == Mode::UpdateCardKeepData {
+                            ui.label("The firmware's own request to wipe is removed, so the device keeps its user data. Only do this when the new firmware can use the existing data.");
+                        } else {
+                            ui.label("The device wipes its user data on the boot after installing, which is what this firmware asks for.");
+                        }
                     }
                     Mode::Full => {
                         ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
@@ -757,7 +764,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let go = match self.mode {
                         Mode::Upgrade => "Yes, upgrade",
-                        Mode::UpdateCard => "Yes, make the card",
+                        Mode::UpdateCard | Mode::UpdateCardKeepData => "Yes, make the card",
                         Mode::Full => "Yes, erase and write",
                     };
                     if ui.add(egui::Button::new(RichText::new(go).color(Color32::WHITE)).fill(ACCENT)).clicked() {

@@ -71,6 +71,10 @@ pub fn helper_args(spec: &crate::job::JobSpec, progress_file: &Path) -> Vec<Stri
     match spec.mode {
         crate::plan::Mode::Upgrade => a.push("--upgrade".into()),
         crate::plan::Mode::UpdateCard => a.push("--update-card".into()),
+        crate::plan::Mode::UpdateCardKeepData => {
+            a.push("--update-card".into());
+            a.push("--keep-data".into());
+        }
         crate::plan::Mode::Full => {}
     }
     a

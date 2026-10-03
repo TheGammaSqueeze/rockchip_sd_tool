@@ -27,11 +27,27 @@ const BACKUP_BOOT_SECTOR: u64 = 6;
 const ROOT_CLUSTER: u32 = 2;
 const DIR_ENTRY: usize = 32;
 
-/// A file to place in the filesystem.
+/// A file to place in the filesystem. Its contents may come from several ranges laid end to end,
+/// which is how a firmware image can be written mostly straight from disk with a few bytes
+/// replaced in the middle, without ever holding the whole thing in memory.
 pub struct FatFile {
     pub name: String,
-    pub len: u64,
-    pub source: Source,
+    pub segments: Vec<(u64, Source)>,
+}
+
+impl FatFile {
+    pub fn new(name: &str, len: u64, source: Source) -> FatFile {
+        FatFile { name: name.to_string(), segments: vec![(len, source)] }
+    }
+    pub fn from_segments(name: &str, segments: Vec<(u64, Source)>) -> FatFile {
+        FatFile { name: name.to_string(), segments }
+    }
+    pub fn len(&self) -> u64 {
+        self.segments.iter().map(|(l, _)| *l).sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// One range of the finished partition, at `offset` bytes from its start.
@@ -220,10 +236,11 @@ pub fn build(sectors: u64, label: &str, files: Vec<FatFile>, volume_id: u32) -> 
     let mut next = ROOT_CLUSTER + 1;
     let mut placed: Vec<(u32, u64)> = Vec::new(); // (first cluster, cluster count)
     for f in &files {
-        if f.len > MAX_FILE {
-            bail!("{} is {} bytes; FAT32 cannot hold a file of 4 GiB or more", f.name, f.len);
+        let len = f.len();
+        if len > MAX_FILE {
+            bail!("{} is {} bytes; FAT32 cannot hold a file of 4 GiB or more", f.name, len);
         }
-        let clusters = if f.len == 0 { 0 } else { (f.len + cluster_bytes - 1) / cluster_bytes };
+        let clusters = if len == 0 { 0 } else { (len + cluster_bytes - 1) / cluster_bytes };
         placed.push((if clusters == 0 { 0 } else { next }, clusters));
         next += clusters as u32;
     }
@@ -268,7 +285,7 @@ pub fn build(sectors: u64, label: &str, files: Vec<FatFile>, volume_id: u32) -> 
         if !fits_short(&f.name, &short) {
             push_lfn_entries(&mut dir, &f.name, short_name_checksum(&short));
         }
-        dir.extend_from_slice(&dir_entry(&short, 0x20, placed[i].0, f.len as u32));
+        dir.extend_from_slice(&dir_entry(&short, 0x20, placed[i].0, f.len() as u32));
     }
     if dir.len() as u64 > cluster_bytes {
         bail!("too many files for a single-cluster root directory");
@@ -334,7 +351,14 @@ pub fn build(sectors: u64, label: &str, files: Vec<FatFile>, volume_id: u32) -> 
         if placed[i].1 == 0 {
             continue;
         }
-        pieces.push(Piece { offset: g.cluster_sector(placed[i].0) * SECTOR, len: f.len, source: f.source });
+        let mut at = g.cluster_sector(placed[i].0) * SECTOR;
+        for (len, source) in f.segments {
+            if len == 0 {
+                continue;
+            }
+            pieces.push(Piece { offset: at, len, source });
+            at += len;
+        }
     }
     pieces.sort_by_key(|p| p.offset);
     Ok((g, pieces))
@@ -392,9 +416,9 @@ mod tests {
     fn lays_out_a_volume_that_reads_back() {
         let sectors = 2 * (1 << 30) / SECTOR; // 2 GiB
         let files = vec![
-            FatFile { name: "sdupdate.img".into(), len: 5_000_000, source: Source::File { offset: 0, len: 5_000_000 } },
-            FatFile { name: "rksdfw.tag".into(), len: 4, source: Source::Bytes(vec![1, 2, 3, 4].into()) },
-            FatFile { name: "sd_boot_config.config".into(), len: 10, source: Source::Bytes(vec![b'x'; 10].into()) },
+            FatFile::new("sdupdate.img", 5_000_000, Source::File { offset: 0, len: 5_000_000 }),
+            FatFile::new("rksdfw.tag", 4, Source::Bytes(vec![1, 2, 3, 4].into())),
+            FatFile::new("sd_boot_config.config", 10, Source::Bytes(vec![b'x'; 10].into())),
         ];
         let (g, pieces) = build(sectors, "UPGRADE", files, 0x1234_5678).unwrap();
         // Nothing overlaps and everything is inside the partition.

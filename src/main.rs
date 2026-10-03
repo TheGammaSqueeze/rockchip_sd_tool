@@ -69,6 +69,10 @@ enum Cmd {
         /// recovery and flashes its own internal storage from the firmware carried on the card.
         #[arg(long)]
         update_card: bool,
+        /// With --update-card: clear the boot command inside the firmware the card carries, so
+        /// the device keeps its user data instead of wiping itself after installing.
+        #[arg(long, requires = "update_card")]
+        keep_data: bool,
         /// Do not ask for confirmation before writing to a device.
         #[arg(short, long)]
         yes: bool,
@@ -220,7 +224,7 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                 println!("no removable disks found{}", if all { "" } else { " (use --all to list every disk)" });
             }
         }
-        Cmd::Write { image, to, size, no_verify, no_block_verify, upgrade, update_card, yes, xz_level, progress_file } => {
+        Cmd::Write { image, to, size, no_verify, no_block_verify, upgrade, update_card, keep_data, yes, xz_level, progress_file } => {
             let is_dev = disks::is_block_device_path(&to);
             let size_bytes = match &size {
                 Some(s) => Some(parse_size(s).ok_or_else(|| anyhow::anyhow!("bad size '{s}'"))?),
@@ -228,6 +232,8 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
             };
             let mode = if upgrade {
                 rockchip_sd_tool::plan::Mode::Upgrade
+            } else if update_card && keep_data {
+                rockchip_sd_tool::plan::Mode::UpdateCardKeepData
             } else if update_card {
                 rockchip_sd_tool::plan::Mode::UpdateCard
             } else {
@@ -251,7 +257,11 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                         if upgrade {
                             eprintln!("About to UPGRADE {} ({}, {}) from {}: the firmware partitions are replaced; the partition table, user data and the device's own state (misc, cache, metadata) are kept.", d.path, d.model, human_bytes(d.size), image.display());
                         } else if update_card {
-                            eprintln!("About to ERASE {} ({}, {}) and make a firmware update card from {}: the device will flash its own internal storage from it.", d.path, d.model, human_bytes(d.size), image.display());
+                            eprintln!(
+                                "About to ERASE {} ({}, {}) and make a firmware update card from {}: the device will flash its own internal storage from it{}.",
+                                d.path, d.model, human_bytes(d.size), image.display(),
+                                if keep_data { " and keep its user data" } else { " and then wipe its user data, as the firmware asks" }
+                            );
                         } else {
                             eprintln!("About to ERASE {} ({}, {}) and write {}.", d.path, d.model, human_bytes(d.size), image.display());
                         }

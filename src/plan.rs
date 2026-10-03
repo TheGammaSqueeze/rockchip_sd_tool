@@ -142,6 +142,19 @@ pub enum Mode {
     /// Make a firmware update card: the device boots from it into recovery and flashes its own
     /// internal storage from a copy of the firmware carried in a FAT partition on the card.
     UpdateCard,
+    /// The same card, but with the factory wipe suppressed, so the device keeps its user data
+    /// across the update. See [`neutralise_misc_item`].
+    UpdateCardKeepData,
+}
+
+impl Mode {
+    pub fn is_update_card(self) -> bool {
+        matches!(self, Mode::UpdateCard | Mode::UpdateCardKeepData)
+    }
+    /// True when the mode is meant to leave what is already on the device alone.
+    pub fn keeps_user_data(self) -> bool {
+        matches!(self, Mode::Upgrade | Mode::UpdateCardKeepData)
+    }
 }
 
 /// Files an update card carries in its FAT partition, with the names the device looks for.
@@ -332,6 +345,12 @@ pub fn build_update_card(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
     build_with_mode(img, total_sectors, None, Mode::UpdateCard)
 }
 
+/// As [`build_update_card`], but the firmware the card carries has its boot command cleared, so
+/// the device does not wipe itself after installing it.
+pub fn build_update_card_keep_data(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
+    build_with_mode(img, total_sectors, None, Mode::UpdateCardKeepData)
+}
+
 fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptEntry]>) -> Result<Plan> {
     let mode = if existing.is_some() { Mode::Upgrade } else { Mode::Full };
     build_with_mode(img, total_sectors, existing, mode)
@@ -354,7 +373,7 @@ fn build_with_mode(
             check_layout(&img.parameter, e)?;
             (None, e.to_vec())
         }
-        None if mode == Mode::UpdateCard => {
+        None if mode.is_update_card() => {
             // An update card's table covers only the firmware area. Everything past it is the
             // data partition that carries the firmware file, described by a master boot record
             // instead, so listing those partitions here would only overlap it.
@@ -381,7 +400,7 @@ fn build_with_mode(
     let mut notes = Vec::new();
 
     // 1. Clear MBR: 1 KiB of zeros at sector 0. An upgrade keeps the table that is there.
-    if mode == Mode::Full || mode == Mode::UpdateCard {
+    if mode == Mode::Full || mode.is_update_card() {
         ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
     } else {
         notes.push(
@@ -420,7 +439,7 @@ fn build_with_mode(
 
     // An update card is only written as far as the partition the device's recovery lives in:
     // everything past it belongs to the data partition that carries the firmware file.
-    let update_limit = if mode == Mode::UpdateCard {
+    let update_limit = if mode.is_update_card() {
         let e = entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(UPGRADE_PROGRAM_PARTITION))
@@ -444,7 +463,7 @@ fn build_with_mode(
             }
         }
         if item.name.eq_ignore_ascii_case("parameter") {
-            if mode == Mode::UpdateCard {
+            if mode.is_update_card() {
                 // The legacy parameter block: eight copies, which is where a Rockchip bootloader
                 // looks for the layout when it is not reading a GPT.
                 let data = img.read_range(item.offset, item.size as usize)?;
@@ -462,7 +481,7 @@ fn build_with_mode(
             // GPT layouts get their table from the GPT step; the parameter item is not written.
             continue;
         }
-        if mode == Mode::UpdateCard && item.name.eq_ignore_ascii_case("misc") {
+        if mode.is_update_card() && item.name.eq_ignore_ascii_case("misc") {
             // Replace the image's misc with the command that sends the device into recovery to
             // run the update from this card.
             let mut data = update_card_bcb();
@@ -626,13 +645,13 @@ fn build_with_mode(
     }
 
     // 4. GPT: primary (34 sectors at 0), backup (33 sectors at total - 33).
-    if mode == Mode::UpdateCard {
+    if mode.is_update_card() {
         // Only the header and the entries, starting at sector 1. Sector 0 is left for a real
         // master boot record, so an operating system sees the FAT partition while the
         // bootloader still finds the firmware partitions through the GPT.
         let g = gpt_img.as_ref().expect("an update card builds its own table");
         ops.push(Op { step: "GPT".into(), sector: 1, sectors: 33, source: Source::Bytes(g.primary[SECTOR as usize..].to_vec().into()) });
-        add_update_card_data(img, total_sectors, &mut ops, &mut notes)?;
+        add_update_card_data(img, total_sectors, mode, &mut ops, &mut notes)?;
     } else if let Some(g) = &gpt_img {
         ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(g.primary.clone().into()) });
         ops.push(Op { step: "GPT".into(), sector: gpt::backup_sector(total_sectors), sectors: 33, source: Source::Bytes(g.backup.clone().into()) });
@@ -667,11 +686,122 @@ pub fn minimum_sectors_update_card(img: &RkfwImage) -> Result<u64> {
     Ok(start + payload + overhead + UPDATE_CARD_TAIL)
 }
 
+/// Builds the firmware the card carries with the boot command removed from its `misc` item, so
+/// that installing it does not leave the device asking to wipe itself on the next boot.
+///
+/// The device's recovery writes every partition the image carries, `misc` included, and the image
+/// ships that partition holding "boot-recovery" with "--wipe_all". The install itself never
+/// touches user data; the loss happens on the boot afterwards, when the device reads the command
+/// it was just given. Clearing both control blocks in that one item is therefore the whole
+/// difference between an update that keeps user data and one that does not.
+///
+/// The container is accepted on the strength of its magic and the digest at the end of the file,
+/// so the digest is recomputed over the patched contents. Returns the ranges the file is made of
+/// and a line describing what was done.
+pub fn neutralise_misc_item(img: &RkfwImage) -> Result<(Vec<(u64, Source)>, String)> {
+    let item = img
+        .af
+        .item("misc")
+        .ok_or_else(|| anyhow::anyhow!("this image has no misc partition image, so there is no boot command to clear"))?;
+    if item.size < (BCB_OFFSET_ROCKCHIP + BCB_SIZE) as u64 {
+        bail!("the image's misc is only {} bytes, which is not the layout this expects", item.size);
+    }
+    let mut patched = img.read_range(item.offset, item.size as usize)?;
+    let had = bcb_has_command(&patched, BCB_OFFSET_GOOGLE) || bcb_has_command(&patched, BCB_OFFSET_ROCKCHIP);
+    for off in [BCB_OFFSET_GOOGLE, BCB_OFFSET_ROCKCHIP] {
+        patched[off..off + BCB_SIZE].fill(0);
+    }
+
+    // The body is everything but the digest the container ends with.
+    let body = match &img.md5_hex {
+        Some(_) => img.file_size - 32,
+        None => img.file_size,
+    };
+    let start = item.offset;
+    let end = item.offset + item.size;
+    if end > body {
+        bail!("the image's misc lies outside the container body");
+    }
+
+    // Every range is grown out to whole sectors, because the card is written in sectors: a range
+    // that began part way through one would be placed at the sector below it and overwrite its
+    // neighbour. The grown edges are filled from the image, so the contents are unchanged.
+    let aligned_start = start / SECTOR * SECTOR;
+    let aligned_end = (end + SECTOR - 1) / SECTOR * SECTOR;
+    if aligned_end > body {
+        bail!("the image's misc sits too close to the end of the container to patch safely");
+    }
+    let mut block = img.read_range(aligned_start, (aligned_end - aligned_start) as usize)?;
+    let at = (start - aligned_start) as usize;
+    block[at..at + patched.len()].copy_from_slice(&patched);
+
+    let mut segments: Vec<(u64, Source)> = Vec::new();
+    if aligned_start > 0 {
+        segments.push((aligned_start, Source::File { offset: 0, len: aligned_start }));
+    }
+    segments.push((aligned_end - aligned_start, Source::Bytes(block.into())));
+
+    let mut note = format!(
+        "the firmware on the card has its boot command cleared{}, so the device keeps its user data",
+        if had { "" } else { " (it carried none)" }
+    );
+
+    match &img.md5_hex {
+        None => {
+            if aligned_end < body {
+                segments.push((body - aligned_end, Source::File { offset: aligned_end, len: body - aligned_end }));
+            }
+        }
+        Some(_) => {
+            // The digest is only 32 bytes and the body rarely ends on a sector boundary, so the
+            // last part-sector of the body and the digest go out together as one range.
+            let digest = patched_md5(img, start, &patched, body)?;
+            let tail_start = std::cmp::max(body / SECTOR * SECTOR, aligned_end);
+            if tail_start > aligned_end {
+                segments.push((tail_start - aligned_end, Source::File { offset: aligned_end, len: tail_start - aligned_end }));
+            }
+            let mut tail = img.read_range(tail_start, (body - tail_start) as usize)?;
+            tail.extend_from_slice(digest.as_bytes());
+            segments.push((tail.len() as u64, Source::Bytes(tail.into())));
+            note.push_str("; its checksum is recomputed to match");
+        }
+    }
+    Ok((segments, note))
+}
+
+/// Streams the container, substituting the patched range, and returns the digest as the 32
+/// lower-case hexadecimal characters the container stores.
+fn patched_md5(img: &RkfwImage, patch_at: u64, patch: &[u8], body: u64) -> Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(&img.path)?;
+    let mut ctx = crate::md5::Md5::new();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut pos = 0u64;
+    while pos < body {
+        let n = std::cmp::min(buf.len() as u64, body - pos) as usize;
+        f.read_exact(&mut buf[..n])?;
+        // Overlay whatever part of the patched range falls in this chunk.
+        let (cs, ce) = (pos, pos + n as u64);
+        let (ps, pe) = (patch_at, patch_at + patch.len() as u64);
+        if ps < ce && pe > cs {
+            let from = std::cmp::max(cs, ps);
+            let to = std::cmp::min(ce, pe);
+            let dst = (from - cs) as usize..(to - cs) as usize;
+            let src = (from - ps) as usize..(to - ps) as usize;
+            buf[dst].copy_from_slice(&patch[src]);
+        }
+        ctx.update(&buf[..n]);
+        pos += n as u64;
+    }
+    Ok(ctx.finish_hex())
+}
+
 /// Lays out the data partition of an update card: a master boot record, then a FAT32 filesystem
 /// holding the firmware image and the two files the device's recovery reads.
 fn add_update_card_data(
     img: &RkfwImage,
     total_sectors: u64,
+    mode: Mode,
     ops: &mut Vec<Op>,
     notes: &mut Vec<String>,
 ) -> Result<()> {
@@ -695,22 +825,17 @@ fn add_update_card_data(
     }
 
     let config = update_card_config();
+    let firmware = if mode == Mode::UpdateCardKeepData {
+        let (segments, what) = neutralise_misc_item(img)?;
+        notes.push(what);
+        crate::fat32::FatFile::from_segments(UPDATE_IMAGE_NAME, segments)
+    } else {
+        crate::fat32::FatFile::new(UPDATE_IMAGE_NAME, img.file_size, Source::File { offset: 0, len: img.file_size })
+    };
     let files = vec![
-        crate::fat32::FatFile {
-            name: UPDATE_IMAGE_NAME.into(),
-            len: img.file_size,
-            source: Source::File { offset: 0, len: img.file_size },
-        },
-        crate::fat32::FatFile {
-            name: UPDATE_TAG_NAME.into(),
-            len: 0,
-            source: Source::Bytes(Vec::new().into()),
-        },
-        crate::fat32::FatFile {
-            name: UPDATE_CONFIG_NAME.into(),
-            len: config.len() as u64,
-            source: Source::Bytes(config.into()),
-        },
+        firmware,
+        crate::fat32::FatFile::new(UPDATE_TAG_NAME, 0, Source::Bytes(Vec::new().into())),
+        crate::fat32::FatFile::new(UPDATE_CONFIG_NAME, config.len() as u64, Source::Bytes(config.into())),
     ];
     // A volume id derived from the image keeps a rebuild of the same firmware identical.
     let volume_id = crate::rkcrc::crc32_rk(img.path.to_string_lossy().as_bytes()) ^ (img.file_size as u32);
@@ -719,6 +844,11 @@ fn add_update_card_data(
 
     ops.push(Op { step: "MBR".into(), sector: 0, sectors: 1, source: Source::Bytes(update_card_mbr(start, sectors).into()) });
     for p in pieces {
+        // The card is written in whole sectors, so a range that did not begin on one would land
+        // on the sector below and overwrite its neighbour.
+        if p.offset % SECTOR != 0 {
+            bail!("internal error: a filesystem range at byte {} does not start on a sector", p.offset);
+        }
         let n = sectors_for(p.len);
         ops.push(Op { step: "firmware file".into(), sector: start + p.offset / SECTOR, sectors: n, source: p.source });
     }

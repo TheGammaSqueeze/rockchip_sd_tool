@@ -143,6 +143,24 @@ partition passes 2 GiB, which the recovery on these devices cannot read because 
 that partition as `vfat`, so this tool always makes FAT32; and FAT32 cannot hold a file of 4 GiB
 or more, so an image that large is refused with a clear message rather than written unusably.
 
+#### Keeping user data on an update card
+
+An update card normally leaves the device as a fresh install, because the firmware's own `misc`
+item carries "boot-recovery" and "recovery\n--wipe_all", and the recovery that installs the
+firmware writes that item onto the device verbatim. On the boot after the install the device
+therefore reads a wipe instruction and erases user data.
+
+**Update card, keep user data** (`--update-card --keep-data`) makes the same card, except that the
+copy of the firmware placed on it has the two Android bootloader control blocks inside its `misc`
+item cleared, and the image's trailing MD5 recomputed so the recovery still accepts it. Nothing
+else in the firmware is altered, and no partition of the device is skipped: every partition the
+firmware contains is still installed, including the system and the bootloader. What changes is
+only the instruction left behind for the next boot, so `userdata` and `metadata` survive.
+
+Only use it when the new firmware can actually read the data the device already has. Across a
+major platform change, or whenever the release notes ask for a clean install, write a plain
+update card and let it wipe.
+
 ### Command line
 
 ```
@@ -155,6 +173,7 @@ rockchip_sd_tool write <image.img> --to card.img.xz --size 128GB
 rockchip_sd_tool write <image.img> --to card.img --size 250347520s
 rockchip_sd_tool write <image.img> --to /dev/sdX --upgrade    (keep the table and user data)
 rockchip_sd_tool write <image.img> --to /dev/sdX --update-card (a card that flashes the device)
+rockchip_sd_tool write <image.img> --to /dev/sdX --update-card --keep-data
 rockchip_sd_tool verify <image.img> --from /dev/sdX
 ```
 
@@ -168,7 +187,8 @@ as long as compressing the firmware itself, and the block index lets `verify` an
 post-write verification seek instead of decoding the whole file.
 
 Flags: `--upgrade` keeps the partition table and user data, `--update-card` makes a firmware
-update card instead of a boot card, `--no-verify` skips the
+update card instead of a boot card, `--keep-data` (with `--update-card`) stops the install
+wiping the device, `--no-verify` skips the
 final full verification pass, `--no-block-verify` skips the per-block read-back,
 `--yes` skips the confirmation for devices,
 `--xz-level N` sets the xz preset (default 3). On Linux the `write` command needs

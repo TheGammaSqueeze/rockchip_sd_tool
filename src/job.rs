@@ -56,6 +56,7 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
             plan::build_upgrade(&img, total_sectors, &entries)?
         }
         plan::Mode::UpdateCard => plan::build_update_card(&img, total_sectors)?,
+        plan::Mode::UpdateCardKeepData => plan::build_update_card_keep_data(&img, total_sectors)?,
         plan::Mode::Full => plan::build(&img, total_sectors)?,
     };
     let opts = writer::WriteOptions { verify_blocks: spec.verify_blocks, ..Default::default() };
@@ -68,7 +69,7 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
                 bail!("the compressed image decodes to {} bytes, expected {}", reader.size(), total_sectors * 512);
             }
             writer::verify_target(&ops, &img, reader.as_mut(), progress, cancel)?;
-        } else if plan.mode == plan::Mode::UpdateCard {
+        } else if plan.mode.is_update_card() {
             // An update card has no protective master boot record to check structurally, and
             // nothing rewrites its table, so every range is compared byte for byte.
             writer::verify_target(&ops, &img, target.as_mut(), progress, cancel)?;

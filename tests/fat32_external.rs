@@ -48,9 +48,16 @@ fn the_filesystem_passes_fsck_and_reads_back() {
     let config = b"#rockchip sdcard boot config file for factory\nfw_update = 1\n".to_vec();
 
     let files = vec![
-        FatFile { name: "sdupdate.img".into(), len: payload.len() as u64, source: Source::File { offset: 0, len: payload.len() as u64 } },
-        FatFile { name: "rksdfw.tag".into(), len: 4, source: Source::Bytes(b"RKFW".to_vec().into()) },
-        FatFile { name: "sd_boot_config.config".into(), len: config.len() as u64, source: Source::Bytes(config.clone().into()) },
+        // Two ranges laid end to end, as a patched firmware image is written.
+        FatFile::from_segments(
+            "sdupdate.img",
+            vec![
+                (1000, Source::File { offset: 0, len: 1000 }),
+                (payload.len() as u64 - 1000, Source::File { offset: 1000, len: payload.len() as u64 - 1000 }),
+            ],
+        ),
+        FatFile::new("rksdfw.tag", 4, Source::Bytes(b"RKFW".to_vec().into())),
+        FatFile::new("sd_boot_config.config", config.len() as u64, Source::Bytes(config.clone().into())),
     ];
     let (_g, pieces) = fat32::build(sectors, "UPGRADE", files, 0xdead_beef).unwrap();
     materialise(&img, sectors, &pieces, &payload);
