@@ -26,8 +26,18 @@ fn main() {
   </application>
 </assembly>"#,
         );
+        // A complete version resource. Antivirus heuristics score a binary with no company,
+        // no copyright and no description as more suspicious than one that identifies itself.
+        let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
         res.set("ProductName", "Rockchip SD Tool");
-        res.set("FileDescription", "Rockchip SD Tool");
+        res.set("FileDescription", "Rockchip SD Tool: writes Rockchip RKFW firmware images to SD cards");
+        res.set("CompanyName", "TheGammaSqueeze");
+        res.set("LegalCopyright", "Copyright (c) TheGammaSqueeze. MIT License.");
+        res.set("OriginalFilename", "rockchip_sd_tool.exe");
+        res.set("InternalName", "rockchip_sd_tool");
+        res.set("Comments", "Source: https://github.com/TheGammaSqueeze/rockchip_sd_tool");
+        res.set("ProductVersion", &version);
+        res.set("FileVersion", &version);
         if std::path::Path::new("assets/icon.ico").exists() {
             res.set_icon("assets/icon.ico");
         }

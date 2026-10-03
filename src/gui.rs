@@ -37,7 +37,7 @@ pub fn run(preload: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rockchip SD Tool")
-            .with_inner_size(Vec2::new(760.0, 520.0))
+            .with_inner_size(Vec2::new(760.0, 580.0))
             .with_min_inner_size(Vec2::new(640.0, 440.0))
             .with_icon(icon()),
         ..Default::default()
@@ -57,16 +57,20 @@ pub fn run(preload: Option<PathBuf>) -> Result<()> {
 }
 
 fn icon() -> egui::IconData {
-    // A simple generated icon: a rounded card shape with a notch.
+    // The same SD card shape as assets/icon.ico: a cut corner, four contacts and a label stripe.
     let n = 64usize;
     let mut rgba = vec![0u8; n * n * 4];
     for y in 0..n {
         for x in 0..n {
-            let inside = x >= 14 && x < 50 && y >= 6 && y < 58 && !(x >= 42 && y < 14);
-            let stripe = inside && y >= 40 && y < 46 && x >= 20 && x < 44;
+            let (fx, fy) = (x as i32, y as i32);
+            let inside = fx >= 14 && fx < 50 && fy >= 6 && fy < 58 && !(fx >= 42 && fy < 14 && fx - 42 > 13 - fy);
+            let stripe = inside && fy >= 40 && fy < 46 && fx >= 20 && fx < 44;
+            let pin = inside && fy >= 12 && fy < 24 && (22..46).contains(&fx) && (fx - 22) % 6 < 3;
             let i = (y * n + x) * 4;
             if stripe {
                 rgba[i..i + 4].copy_from_slice(&[255, 215, 0, 255]);
+            } else if pin {
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 210]);
             } else if inside {
                 rgba[i..i + 4].copy_from_slice(&[ACCENT.r(), ACCENT.g(), ACCENT.b(), 255]);
             }
@@ -425,13 +429,35 @@ fn mode_label(m: Mode) -> &'static str {
     }
 }
 
-fn mode_help(m: Mode) -> &'static str {
+/// What each mode does, what it keeps, and when to pick it. Shown in the window under the
+/// buttons and as the tooltip in the mode list, so the choice does not need the README.
+fn mode_help(m: Mode) -> [&'static str; 3] {
     match m {
-        Mode::Full => "Makes a card the device runs from. Everything on the card is erased.",
-        Mode::Upgrade => "Writes the loader and the firmware partitions onto a card that already has this image's layout, and keeps the partition table, user data and the device's own state. The write stops before it starts if the layout does not match.",
-        Mode::UpdateCard => "Makes a card that flashes the device's own internal storage. The device boots from it into recovery, installs the firmware carried on the card, and afterwards runs from its internal storage. The card needs room for the whole firmware file. As the firmware asks, the device wipes its user data on the boot after installing.",
-        Mode::UpdateCardKeepData => "The same card, with the firmware's own request to wipe removed, so the device keeps its user data across the update. Only safe when the new firmware can use the existing data; the wipe exists for the upgrades where it cannot.",
+        Mode::Full => [
+            "Makes a card the device runs from, with the loader, the partition table and every partition the firmware carries.",
+            "Erases everything already on the card. The device's own internal storage is not touched.",
+            "Use it for a new card, or to start again from a clean install.",
+        ],
+        Mode::Upgrade => [
+            "Re-writes the loader and the firmware partitions on a card that already runs this firmware's layout.",
+            "Keeps the partition table, your saves and settings and everything else on the card.",
+            "Use it to move a card you already play on to a newer release. It stops before writing anything if the card's layout does not match the firmware.",
+        ],
+        Mode::UpdateCard => [
+            "Makes a card that installs the firmware onto the device's own internal storage. The device boots from the card once, goes into recovery, flashes itself and afterwards runs without the card.",
+            "Erases the card, and wipes the device's user data on the boot after installing, because the firmware asks for that.",
+            "Use it for devices that run from internal storage, and whenever a release asks for a clean install. The card has to be big enough for the whole firmware file.",
+        ],
+        Mode::UpdateCardKeepData => [
+            "The same installing card, except that the firmware's own request to wipe is removed from the copy carried on the card. Every partition is still installed.",
+            "Erases the card, and keeps the user data on the device.",
+            "Use it only when the new firmware can read the data the device already has. If the release notes ask for a clean install, use the plain update card instead.",
+        ],
     }
+}
+
+fn mode_tooltip(m: Mode) -> String {
+    mode_help(m).join("\n\n")
 }
 
 fn fmt_dur(d: Duration) -> String {
@@ -561,7 +587,7 @@ impl eframe::App for App {
                             .selected_text(mode_label(self.mode))
                             .show_ui(ui, |ui| {
                                 for m in [Mode::Full, Mode::Upgrade, Mode::UpdateCard, Mode::UpdateCardKeepData] {
-                                    ui.selectable_value(&mut self.mode, m, mode_label(m)).on_hover_text(mode_help(m));
+                                    ui.selectable_value(&mut self.mode, m, mode_label(m)).on_hover_text(mode_tooltip(m));
                                 }
                             });
                     });
@@ -595,8 +621,13 @@ impl eframe::App for App {
                 let color = if *ok { OK_GREEN } else { ACCENT };
                 ui.label(RichText::new(msg).color(color).strong());
             } else {
-                ui.label(RichText::new("Pick a Rockchip RKFW firmware image (.img), then the SD card to write it to.").weak());
-                ui.label(RichText::new("You can also write the card image to a file (.img or .img.xz) for a card of a given size.").weak());
+                let [what, keeps, when] = mode_help(self.mode);
+                ui.label(RichText::new(mode_label(self.mode)).strong());
+                ui.label(RichText::new(what).weak());
+                ui.label(RichText::new(keeps).weak());
+                ui.label(RichText::new(when).weak());
+                ui.add_space(6.0);
+                ui.label(RichText::new("Pick a Rockchip RKFW firmware image (.img), then the SD card to write it to. You can also write the card image to a file (.img or .img.xz) for a card of a given size.").weak());
             }
 
             if let Some(i) = &self.image {

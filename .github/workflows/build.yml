@@ -98,6 +98,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Needed to sign the build provenance attestation for the release files.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
@@ -107,6 +110,15 @@ jobs:
         run: |
           cd artifacts
           for d in */; do (cd "$d" && zip -r "../${d%/}.zip" .); done
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: artifacts/*.zip
       - name: Release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -115,8 +127,19 @@ jobs:
           if [ ! -s notes.md ]; then echo "## $VERSION" > notes.md; fi
           echo >> notes.md
           cat .github/release_instructions.md >> notes.md
+          # The checksums of the files attached to this release, for anyone verifying a download.
+          {
+            echo
+            echo '### Checksums (SHA-256)'
+            echo
+            echo '```'
+            cat artifacts/SHA256SUMS.txt
+            echo '```'
+          } >> notes.md
       - uses: softprops/action-gh-release@v2
         with:
           name: Rockchip SD Tool ${{ github.ref_name }}
           body_path: notes.md
-          files: artifacts/*.zip
+          files: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt

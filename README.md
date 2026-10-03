@@ -34,11 +34,65 @@ What it does:
 
 | | |
 | --- | --- |
-| **Three modes.** A boot card the device runs from, an upgrade that keeps user data, or a card that flashes the device's internal storage. <br> ![The write modes](assets/screenshots/02-modes.png) | **Choose the card.** Only removable disks are listed; the system disk is never selectable. <br> ![Choosing the card](assets/screenshots/03-choose-card.png) |
+| **Four modes.** A boot card the device runs from, an upgrade that keeps user data, a card that flashes the device's internal storage, and the same card without the wipe. <br> ![The write modes](assets/screenshots/02-modes.png) | **Choose the card.** Only removable disks are listed; the system disk is never selectable. <br> ![Choosing the card](assets/screenshots/03-choose-card.png) |
 | **Or write to a file.** Pick the size of the card the image is meant for and write a `.img` or `.img.xz`. <br> ![Writing to an image file](assets/screenshots/04-image-file.png) | **Confirm.** A full write says plainly that the card will be erased. <br> ![Confirming a full write](assets/screenshots/05-confirm.png) |
 | **Writing.** Progress per partition, with the speed and the number of blocks that had to be rewritten. <br> ![Writing in progress](assets/screenshots/06-writing.png) | **Done.** The card is verified before it is released. <br> ![Write finished](assets/screenshots/07-done.png) |
 | **Upgrade instead.** The same button re-flashes the firmware partitions and keeps everything else. <br> ![Confirming an upgrade](assets/screenshots/08-upgrade-confirm.png) | **Upgrade done.** The partition table and user data are still there. <br> ![Upgrade finished](assets/screenshots/09-upgrade-done.png) |
 | **Firmware update card.** It carries the firmware as a file for the device to install. <br> ![Confirming an update card](assets/screenshots/10-update-card-confirm.png) | **Update card done.** Boot the device from it once and it flashes itself. <br> ![Update card finished](assets/screenshots/11-update-card-done.png) |
+| **Keeping the data on an update card.** The confirmation says exactly what the mode changes. <br> ![Confirming a keep-data update card](assets/screenshots/16-update-card-keep-data-confirm.png) | **Guidance in the window.** Whichever option is picked, what it does, what it keeps and when to use it are written under the buttons. <br> ![The guidance shown for a mode](assets/screenshots/13-mode-upgrade.png) |
+
+## Which option should I choose?
+
+The window always shows what the selected option does, what it keeps and when to use it, so the
+choice can be made without this page. The short version:
+
+| Your situation | Option |
+| --- | --- |
+| A new card, or a card you want to start over with | Boot card |
+| A card you already play on, moving to a newer release | Upgrade, keep user data |
+| The device runs from its own internal storage, and you want a clean install | Firmware update card |
+| The device runs from its own internal storage, and you want to keep your saves | Update card, keep user data |
+
+### Boot card (erases all)
+
+![Boot card](assets/screenshots/12-mode-boot-card.png)
+
+Makes a card the device runs from, with the loader, the partition table and every partition the
+firmware carries. Everything already on the card is erased. The device's own internal storage is
+not touched. This is the mode SDDiskTool calls **SD Boot**, and it is what you want for a new
+card.
+
+### Upgrade, keep user data
+
+![Upgrade](assets/screenshots/13-mode-upgrade.png)
+
+Re-writes the loader and the firmware partitions onto a card that already runs this firmware's
+layout, and leaves the partition table alone. Your saves, settings and everything else on the card
+survive. It compares the card's own partition table against the firmware first and stops before
+writing anything if they do not match, so a card from a different release is refused rather than
+half written.
+
+### Firmware update card
+
+![Firmware update card](assets/screenshots/14-mode-update-card.png)
+
+Makes a card that installs the firmware onto the device's internal storage. The device boots from
+the card once, goes into recovery, flashes itself and from then on runs without the card. This is
+SDDiskTool's **Upgrade Firmware** mode. The card has to be big enough to hold the whole firmware
+file, which `info` reports. The device wipes its user data on the boot after installing, because
+that is what the firmware itself asks for.
+
+### Update card, keep user data
+
+![Update card, keep user data](assets/screenshots/15-mode-update-card-keep-data.png)
+
+The same installing card, with one difference: the firmware's own request to wipe is removed from
+the copy carried on the card. Every partition is still installed, the system and the bootloader
+included. Only the instruction left behind for the next boot changes, so the device comes back up
+with its data.
+
+Use it only when the new firmware can read the data the device already has. If the release notes
+ask for a clean install, use the plain update card and let it wipe.
 
 ## Download and build
 
@@ -64,6 +118,47 @@ com.apple.quarantine "Rockchip SD Tool.app"`).
 Linux build dependencies (Debian/Ubuntu): `sudo apt install build-essential libxkbcommon-dev libwayland-dev libgl1-mesa-dev`.
 Windows: Visual Studio Build Tools (C++), which rustup installs on request.
 macOS: Xcode command line tools (`xcode-select --install`).
+
+## Windows SmartScreen and antivirus warnings
+
+Windows may warn about the download, and some antivirus products flag it. The tool is clean; this
+is what causes it and how to check for yourself.
+
+Three ordinary properties of this program look, to a scanner that only sees the file, exactly like
+the properties of something malicious. It asks for administrator rights at launch, it opens raw
+disks and writes to them directly, and it is not signed with a code signing certificate, because
+those cost a few hundred a year and require a company identity check. Every release is also a
+file Windows has never seen before, so it has no reputation to go on.
+
+**Two different warnings, two different meanings.**
+
+* **"Windows protected your PC", with a Run anyway button under More info.** This is SmartScreen
+  reporting that the file is new and unsigned. It is not a detection. Choose More info, then Run
+  anyway.
+* **A named threat, for example `Trojan:Win32/Wacatac.B!ml`.** This is a machine-learning false
+  positive in the antivirus itself. The `!ml` suffix says so. Please report it to your antivirus
+  vendor (Microsoft take reports at https://www.microsoft.com/en-us/wdsi/filesubmission), and open
+  an issue here so the sample can be submitted from this side too. They are usually corrected
+  within a day or two.
+
+**How to check the download yourself.** Every release lists the SHA-256 of each file in its notes
+and attaches `SHA256SUMS.txt`. On Windows:
+
+```
+certutil -hashfile rockchip_sd_tool-windows-x86_64-<version>.zip SHA256
+```
+
+Each release is also built by the GitHub Actions workflow in this repository, never on anyone's
+machine, and the workflow signs a build provenance attestation for the files it produces. With the
+GitHub CLI you can confirm that the exact file you downloaded came from this source:
+
+```
+gh attestation verify rockchip_sd_tool-windows-x86_64-<version>.zip --repo TheGammaSqueeze/rockchip_sd_tool
+```
+
+That is a stronger guarantee than a code signing certificate gives, since it ties the binary to the
+public source and the public build log rather than to a paid-for identity. And because the whole
+source is here, you can always build it yourself with `cargo build --release` and compare.
 
 ## Usage
 

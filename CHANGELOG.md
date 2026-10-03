@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.1
+
+- Each write mode now explains itself in the window: what it does, what it keeps and when to pick
+  it, written under the buttons rather than hidden in a tooltip. The README has a section with a
+  screenshot of each option and a table for choosing between them.
+- Steps against the false positives some antivirus products report. The Windows binary now carries
+  a complete version resource (company, copyright, description, version) and an icon instead of
+  almost no metadata. Every release is signed with a GitHub build provenance attestation, so a
+  download can be traced to this repository's source and build log with
+  `gh attestation verify <file> --repo TheGammaSqueeze/rockchip_sd_tool`, and the SHA-256 of every
+  file is published in the release notes and attached as `SHA256SUMS.txt`. The README explains the
+  difference between the SmartScreen warning and an antivirus detection, and how to check a
+  download.
+
 ## 1.3.0
 
 - New **update card, keep user data** mode (`--update-card --keep-data`, or the fourth entry in
