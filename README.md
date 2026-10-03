@@ -21,6 +21,9 @@ What it does:
   produces (loader, every partition the image carries, GPT);
 * **upgrades** a card that already has that layout without touching the partition table or
   user data, so a firmware update keeps saves and settings;
+* makes a **firmware update card**: the device boots from it, goes into recovery and flashes its
+  own internal storage from the firmware the card carries, which is Rockchip's "Upgrade Firmware"
+  mode;
 * writes the same card image to a raw `.img` or a compressed `.img.xz` for a card size you
   choose, instead of to a card;
 * reads every block back as it writes it and rewrites the ones that come back wrong, then
@@ -31,10 +34,11 @@ What it does:
 
 | | |
 | --- | --- |
-| **Choose the card.** Only removable disks are listed; the system disk is never selectable. <br> ![Choosing the card](assets/screenshots/02-choose-card.png) | **Or write to a file.** Pick the size of the card the image is meant for and write a `.img` or `.img.xz`. <br> ![Writing to an image file](assets/screenshots/03-image-file.png) |
-| **Confirm.** A full write says plainly that the card will be erased. <br> ![Confirming a full write](assets/screenshots/04-confirm.png) | **Writing.** Progress per partition, with the speed and the number of blocks that had to be rewritten. <br> ![Writing in progress](assets/screenshots/05-writing.png) |
-| **Done.** The card is verified before it is released. <br> ![Write finished](assets/screenshots/06-done.png) | **Upgrade instead.** With *Upgrade, keep user data* ticked, the same button re-flashes the partitions and keeps everything else. <br> ![Confirming an upgrade](assets/screenshots/07-upgrade-confirm.png) |
-| **Upgrade done.** The partition table and user data are still there. <br> ![Upgrade finished](assets/screenshots/08-upgrade-done.png) | |
+| **Three modes.** A boot card the device runs from, an upgrade that keeps user data, or a card that flashes the device's internal storage. <br> ![The write modes](assets/screenshots/02-modes.png) | **Choose the card.** Only removable disks are listed; the system disk is never selectable. <br> ![Choosing the card](assets/screenshots/03-choose-card.png) |
+| **Or write to a file.** Pick the size of the card the image is meant for and write a `.img` or `.img.xz`. <br> ![Writing to an image file](assets/screenshots/04-image-file.png) | **Confirm.** A full write says plainly that the card will be erased. <br> ![Confirming a full write](assets/screenshots/05-confirm.png) |
+| **Writing.** Progress per partition, with the speed and the number of blocks that had to be rewritten. <br> ![Writing in progress](assets/screenshots/06-writing.png) | **Done.** The card is verified before it is released. <br> ![Write finished](assets/screenshots/07-done.png) |
+| **Upgrade instead.** The same button re-flashes the firmware partitions and keeps everything else. <br> ![Confirming an upgrade](assets/screenshots/08-upgrade-confirm.png) | **Upgrade done.** The partition table and user data are still there. <br> ![Upgrade finished](assets/screenshots/09-upgrade-done.png) |
+| **Firmware update card.** It carries the firmware as a file for the device to install. <br> ![Confirming an update card](assets/screenshots/10-update-card-confirm.png) | **Update card done.** Boot the device from it once and it flashes itself. <br> ![Update card finished](assets/screenshots/11-update-card-done.png) |
 
 ## Download and build
 
@@ -117,6 +121,28 @@ A raw `.img` file can be upgraded in place the same way; a compressed `.img.xz` 
 
 The screenshots above show the confirmation and the result of an upgrade.
 
+### Firmware update cards
+
+**Firmware update card** (`--update-card`) is the other mode Rockchip's own tool offers, for
+devices that run from internal storage rather than from the card. The card is not one the device
+runs from: you boot the device from it once, it goes into recovery, installs the firmware the card
+carries and then runs from its own storage.
+
+Such a card holds two things. The front of it carries the loader and the firmware partitions up to
+and including `recovery`, so the device can start and reach recovery, with `misc` set to
+"boot-recovery" and "--rk_fwupdate", which is the instruction to install. The rest is an ordinary
+FAT32 partition, described by a master boot record, holding the firmware image as `sdupdate.img`
+together with `sd_boot_config.config` (which carries `fw_update = 1`) and an empty `rksdfw.tag`.
+The partition table the bootloader reads is still a GPT at sector 1, deliberately left without a
+protective entry so that an operating system reads the master boot record and sees the data
+partition while the bootloader reads the GPT and finds the firmware partitions.
+
+The card therefore has to be big enough for the whole firmware file, which `info` reports. Two
+deliberate differences from Rockchip's tool: it formats the data partition as NTFS once the
+partition passes 2 GiB, which the recovery on these devices cannot read because its table mounts
+that partition as `vfat`, so this tool always makes FAT32; and FAT32 cannot hold a file of 4 GiB
+or more, so an image that large is refused with a clear message rather than written unusably.
+
 ### Command line
 
 ```
@@ -128,6 +154,7 @@ rockchip_sd_tool write <image.img> --to \\.\PhysicalDrive2   (Windows, admin pro
 rockchip_sd_tool write <image.img> --to card.img.xz --size 128GB
 rockchip_sd_tool write <image.img> --to card.img --size 250347520s
 rockchip_sd_tool write <image.img> --to /dev/sdX --upgrade    (keep the table and user data)
+rockchip_sd_tool write <image.img> --to /dev/sdX --update-card (a card that flashes the device)
 rockchip_sd_tool verify <image.img> --from /dev/sdX
 ```
 
@@ -140,7 +167,8 @@ of an all-zero block is reused for every zero block, so a 128 GB card image take
 as long as compressing the firmware itself, and the block index lets `verify` and the
 post-write verification seek instead of decoding the whole file.
 
-Flags: `--upgrade` keeps the partition table and user data (above), `--no-verify` skips the
+Flags: `--upgrade` keeps the partition table and user data, `--update-card` makes a firmware
+update card instead of a boot card, `--no-verify` skips the
 final full verification pass, `--no-block-verify` skips the per-block read-back,
 `--yes` skips the confirmation for devices,
 `--xz-level N` sets the xz preset (default 3). On Linux the `write` command needs
@@ -161,6 +189,8 @@ against a card it produced (an RG DS Plus running from that card).
 | partition offsets from `parameter.txt` | every firmware item that has a partition address, in table order; Android sparse images are expanded (the unpacked extent and the last 64 sectors of the partition are zeroed first, DONT_CARE chunks stay zero) |
 | start of `metadata`, `cache`, `userdata` | 4 MiB of zeros each, on a full write only (see below) |
 | total - 33 | backup GPT entries and header |
+
+A firmware update card is laid out differently; see the section above.
 
 Details that matter for a byte-identical result:
 
@@ -211,7 +241,9 @@ the primary and backup GPT (CRCs, ranges, attributes, UUID version), the size ch
 cancellation, the per-block verification with retries (fault injection: a flaky block is
 rewritten, a permanently bad block fails after three attempts), and the upgrade mode (user data
 and the partition table survive, a card with a different layout or no partition table is
-refused without being touched).
+refused without being touched). The FAT32 writer used by update cards is checked against
+`fsck.vfat` and mtools, which read the volume back and confirm the file names and contents, and a
+complete update card is built and its data partition read with `mdir` and `mcopy`.
 
 ## Safety
 

@@ -3,6 +3,7 @@
 
 pub mod blockdev;
 pub mod disks;
+pub mod fat32;
 pub mod gpt;
 pub mod md5;
 pub mod parameter;

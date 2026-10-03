@@ -68,8 +68,10 @@ pub fn helper_args(spec: &crate::job::JobSpec, progress_file: &Path) -> Vec<Stri
     if !spec.verify_blocks {
         a.push("--no-block-verify".into());
     }
-    if spec.upgrade {
-        a.push("--upgrade".into());
+    match spec.mode {
+        crate::plan::Mode::Upgrade => a.push("--upgrade".into()),
+        crate::plan::Mode::UpdateCard => a.push("--update-card".into()),
+        crate::plan::Mode::Full => {}
     }
     a
 }

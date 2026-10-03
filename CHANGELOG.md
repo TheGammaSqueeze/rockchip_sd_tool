@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0
+
+- New **firmware update card** mode (`--update-card`, or the mode list in the window), which is
+  Rockchip's "Upgrade Firmware" option. The card is not one the device runs from: boot the device
+  from it once and it goes into recovery, installs the firmware the card carries and afterwards
+  runs from its own internal storage.
+  The front of the card holds the loader and the firmware partitions up to and including
+  `recovery`, with `misc` set to "boot-recovery" and "--rk_fwupdate"; the rest is a FAT32
+  partition holding the image as `sdupdate.img` with `sd_boot_config.config` and `rksdfw.tag`
+  beside it. The bootloader's GPT stays at sector 1 without a protective entry, so an operating
+  system sees the data partition through the master boot record while the bootloader still finds
+  the firmware partitions.
+  Two deliberate differences from Rockchip's tool: the data partition is always FAT32, because
+  the recovery on these devices mounts it as `vfat` and cannot read the NTFS that tool switches
+  to above 2 GiB; and an image of 4 GiB or more is refused, since FAT32 cannot hold it.
+- The write mode is now a list in the window rather than a checkbox, with the boot card, the
+  upgrade and the update card side by side.
+
 ## 1.1.3
 
 - **A fresh card no longer depends on the first-boot recovery wipe.** The firmware carries no

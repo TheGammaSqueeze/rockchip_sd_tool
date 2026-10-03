@@ -14,6 +14,7 @@ use rockchip_sd_tool::job::JobSpec;
 use rockchip_sd_tool::rkfw::{self, RkfwImage};
 use rockchip_sd_tool::util::{human_bytes, parse_size, vendor_gb};
 use rockchip_sd_tool::writer::{Cancel, Progress};
+use rockchip_sd_tool::plan::Mode;
 use rockchip_sd_tool::{elevate, gpt, plan};
 
 const ACCENT: Color32 = Color32::from_rgb(0xc5, 0x1a, 0x4a);
@@ -82,6 +83,7 @@ struct ImageInfo {
     version: String,
     built: String,
     min_bytes: u64,
+    update_card_bytes: Option<u64>,
     partitions: Vec<String>,
     md5: Option<String>,
 }
@@ -108,6 +110,7 @@ impl ImageInfo {
             version: rkfw::format_version(img.header.version),
             built: img.header.time.to_string(),
             min_bytes: min_sectors * 512,
+            update_card_bytes: plan::minimum_sectors_update_card(&img).ok().map(|s| s * 512),
             partitions,
             md5: img.md5_hex.clone(),
             path,
@@ -151,7 +154,7 @@ struct Job {
     started: Instant,
     target_desc: String,
     is_device: bool,
-    is_upgrade: bool,
+    mode: Mode,
 }
 
 #[derive(PartialEq)]
@@ -166,7 +169,7 @@ struct App {
     image_error: Option<String>,
     storage: Option<Storage>,
     verify: bool,
-    upgrade: bool,
+    mode: Mode,
     popup: Popup,
     disks: Vec<DiskInfo>,
     disks_refreshed: Instant,
@@ -193,7 +196,7 @@ impl App {
             image_error: None,
             storage: None,
             verify: true,
-            upgrade: false,
+            mode: Mode::Full,
             popup: Popup::None,
             disks: disks::list(),
             disks_refreshed: Instant::now(),
@@ -231,6 +234,15 @@ impl App {
         self.outcome = None;
     }
 
+    /// How much card the chosen mode needs.
+    fn needed_bytes(&self) -> u64 {
+        match &self.image {
+            Some(i) if self.mode == Mode::UpdateCard => i.update_card_bytes.unwrap_or(i.min_bytes),
+            Some(i) => i.min_bytes,
+            None => 0,
+        }
+    }
+
     fn file_size(&self) -> Option<u64> {
         if self.custom_size.trim().is_empty() {
             Some(CARD_PRESETS[self.preset].1)
@@ -246,7 +258,7 @@ impl App {
             Storage::Device(d) => (d.path.clone(), None, true),
             Storage::File { path, size } => (path.to_string_lossy().to_string(), Some(*size), false),
         };
-        let size = if self.upgrade { None } else { size };
+        let size = if self.mode == Mode::Upgrade { None } else { size };
         let spec = JobSpec {
             image: img.path.clone(),
             output,
@@ -254,7 +266,7 @@ impl App {
             verify: self.verify,
             xz_level: 3,
             verify_blocks: true,
-            upgrade: self.upgrade,
+            mode: self.mode,
         };
         let target_desc = storage.label();
         let use_helper = is_device && elevate::needs_helper();
@@ -302,7 +314,7 @@ impl App {
             started: Instant::now(),
             target_desc,
             is_device,
-            is_upgrade: self.upgrade,
+            mode: self.mode,
         });
     }
 
@@ -371,7 +383,7 @@ impl App {
         if let Some(r) = finished {
             let elapsed = job.started.elapsed();
             let is_device = job.is_device;
-            let was_upgrade = job.is_upgrade;
+            let was_upgrade = job.mode == Mode::Upgrade;
             let desc = job.target_desc.clone();
             self.job = None;
             self.outcome = Some(match r {
@@ -401,6 +413,22 @@ impl App {
                 }
             }
         }
+    }
+}
+
+fn mode_label(m: Mode) -> &'static str {
+    match m {
+        Mode::Full => "Boot card (erases all)",
+        Mode::Upgrade => "Upgrade, keep user data",
+        Mode::UpdateCard => "Firmware update card",
+    }
+}
+
+fn mode_help(m: Mode) -> &'static str {
+    match m {
+        Mode::Full => "Makes a card the device runs from. Everything on the card is erased.",
+        Mode::Upgrade => "Writes the loader and the firmware partitions onto a card that already has this image's layout, and keeps the partition table, user data and the device's own state. The write stops before it starts if the layout does not match.",
+        Mode::UpdateCard => "Makes a card that flashes the device's own internal storage. The device boots from it into recovery, installs the firmware carried on the card, and afterwards runs from its internal storage. The card needs room for the whole firmware file.",
     }
 }
 
@@ -493,9 +521,9 @@ impl eframe::App for App {
                         self.popup = Popup::Storage;
                     }
                     if let (Some(s), Some(i)) = (&self.storage, &self.image) {
-                        if !self.upgrade && s.size() < i.min_bytes {
+                        if self.mode != Mode::Upgrade && s.size() < self.needed_bytes() {
                             ui.add_space(4.0);
-                            ui.label(RichText::new(format!("too small: {} available, {} needed", human_bytes(s.size()), human_bytes(i.min_bytes))).small().color(ACCENT));
+                            ui.label(RichText::new(format!("too small: {} available, {} needed", human_bytes(s.size()), human_bytes(self.needed_bytes()))).small().color(ACCENT));
                         }
                     }
                 });
@@ -509,7 +537,7 @@ impl eframe::App for App {
                         && self
                             .storage
                             .as_ref()
-                            .map(|s| self.upgrade || s.size() >= self.image.as_ref().unwrap().min_bytes)
+                            .map(|s| self.mode == Mode::Upgrade || s.size() >= self.needed_bytes())
                             .unwrap_or(false);
                     if busy {
                         if ui.add(big_button("CANCEL")).clicked() {
@@ -525,10 +553,16 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     ui.add_enabled(!busy, egui::Checkbox::new(&mut self.verify, "Verify after writing"))
                         .on_hover_text("Every block is already read back and compared right after it is written (and rewritten up to 3 times on mismatch). This adds a second full pass over the card at the end.");
-                    ui.add_enabled(!busy, egui::Checkbox::new(&mut self.upgrade, "Upgrade, keep user data"))
-                        .on_hover_text(
-                            "Writes the loader and the firmware partitions of this image onto a card that already has the same layout, and leaves the partition table, user data and the device's own state (misc, cache, metadata) untouched. The write stops before it starts if the card's layout does not match.",
-                        );
+                    ui.add_enabled_ui(!busy, |ui| {
+                        egui::ComboBox::from_id_salt("mode")
+                            .width(190.0)
+                            .selected_text(mode_label(self.mode))
+                            .show_ui(ui, |ui| {
+                                for m in [Mode::Full, Mode::Upgrade, Mode::UpdateCard] {
+                                    ui.selectable_value(&mut self.mode, m, mode_label(m)).on_hover_text(mode_help(m));
+                                }
+                            });
+                    });
                 });
             });
 
@@ -539,7 +573,13 @@ impl eframe::App for App {
             if let Some(job) = &self.job {
                 let p = &job.progress;
                 let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-                let phase = if p.phase == "verify" { "Verifying" } else if job.is_upgrade { "Upgrading" } else { "Writing" };
+                let phase = if p.phase == "verify" {
+                    "Verifying"
+                } else if job.mode == Mode::Upgrade {
+                    "Upgrading"
+                } else {
+                    "Writing"
+                };
                 ui.label(RichText::new(format!("{phase} {} to {}", p.step, job.target_desc)).strong());
                 ui.add(egui::ProgressBar::new(frac).show_percentage().animate(true));
                 let elapsed = job.started.elapsed().as_secs_f64();
@@ -680,18 +720,29 @@ impl App {
         };
         let mut open = true;
         let mut decided = None;
-        let title = if self.upgrade { "Upgrade this card?" } else { "Erase and write?" };
+        let title = match self.mode {
+            Mode::Upgrade => "Upgrade this card?",
+            Mode::UpdateCard => "Make a firmware update card?",
+            Mode::Full => "Erase and write?",
+        };
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                if self.upgrade {
-                    ui.label(RichText::new(format!("Every partition this image carries will be replaced on {}.", d.label())).strong());
-                    ui.label("The partition table, user data and the device's own state (misc, cache, metadata) are kept. The card must already have this image's layout; it is checked before anything is written.");
-                } else {
-                    ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
+                match self.mode {
+                    Mode::Upgrade => {
+                        ui.label(RichText::new(format!("Every partition this image carries will be replaced on {}.", d.label())).strong());
+                        ui.label("The partition table, user data and the device's own state (misc, cache, metadata) are kept. The card must already have this image's layout; it is checked before anything is written.");
+                    }
+                    Mode::UpdateCard => {
+                        ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
+                        ui.label("The card becomes a firmware update card. A device booted from it goes into recovery and flashes its own internal storage from the firmware on the card; the device does not run from the card.");
+                    }
+                    Mode::Full => {
+                        ui.label(RichText::new(format!("All existing data on {} will be erased.", d.label())).strong());
+                    }
                 }
                 if !d.mounts.is_empty() {
                     ui.label(format!("It is currently mounted at {}; it will be unmounted first.", d.mounts.join(", ")));
@@ -704,7 +755,11 @@ impl App {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let go = if self.upgrade { "Yes, upgrade" } else { "Yes, erase and write" };
+                    let go = match self.mode {
+                        Mode::Upgrade => "Yes, upgrade",
+                        Mode::UpdateCard => "Yes, make the card",
+                        Mode::Full => "Yes, erase and write",
+                    };
                     if ui.add(egui::Button::new(RichText::new(go).color(Color32::WHITE)).fill(ACCENT)).clicked() {
                         decided = Some(true);
                     }

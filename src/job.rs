@@ -22,9 +22,14 @@ pub struct JobSpec {
     pub xz_level: u32,
     /// Read every block back right after writing it and rewrite it on mismatch.
     pub verify_blocks: bool,
-    /// Keep the card's partition table and user data: write only the partitions the image
-    /// carries, onto a card that already has this layout.
-    pub upgrade: bool,
+    /// What the write does to the card as a whole.
+    pub mode: plan::Mode,
+}
+
+impl JobSpec {
+    pub fn is_upgrade(&self) -> bool {
+        self.mode == plan::Mode::Upgrade
+    }
 }
 
 /// Runs the job, reporting progress through `progress`.
@@ -32,24 +37,26 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
     let img = RkfwImage::open(&spec.image)?;
     let is_dev = crate::disks::is_block_device_path(&spec.output);
     let mut target: Box<dyn target::Target> = if is_dev {
-        Box::new(crate::blockdev::BlockDevice::open_for_write_ex(&spec.output, spec.upgrade)?)
+        Box::new(crate::blockdev::BlockDevice::open_for_write_ex(&spec.output, spec.is_upgrade())?)
     } else {
-        let size = if spec.upgrade {
+        let size = if spec.is_upgrade() {
             0
         } else {
             spec.size.ok_or_else(|| anyhow::anyhow!("a card size is required when writing to a file"))?
         };
-        target::open_output_ex(&spec.output, size, spec.xz_level, spec.upgrade)?
+        target::open_output_ex(&spec.output, size, spec.xz_level, spec.is_upgrade())?
     };
     let total_sectors = target.size() / 512;
     if total_sectors == 0 {
         bail!("the target reports a size of zero");
     }
-    let plan = if spec.upgrade {
-        let entries = read_existing_table(target.as_mut())?;
-        plan::build_upgrade(&img, total_sectors, &entries)?
-    } else {
-        plan::build(&img, total_sectors)?
+    let plan = match spec.mode {
+        plan::Mode::Upgrade => {
+            let entries = read_existing_table(target.as_mut())?;
+            plan::build_upgrade(&img, total_sectors, &entries)?
+        }
+        plan::Mode::UpdateCard => plan::build_update_card(&img, total_sectors)?,
+        plan::Mode::Full => plan::build(&img, total_sectors)?,
     };
     let opts = writer::WriteOptions { verify_blocks: spec.verify_blocks, ..Default::default() };
     let ops = writer::write_plan(&plan, &img, target.as_mut(), opts, progress, cancel)?;
@@ -61,6 +68,10 @@ pub fn run(spec: &JobSpec, progress: &mut dyn FnMut(Progress), cancel: &Cancel) 
                 bail!("the compressed image decodes to {} bytes, expected {}", reader.size(), total_sectors * 512);
             }
             writer::verify_target(&ops, &img, reader.as_mut(), progress, cancel)?;
+        } else if plan.mode == plan::Mode::UpdateCard {
+            // An update card has no protective master boot record to check structurally, and
+            // nothing rewrites its table, so every range is compared byte for byte.
+            writer::verify_target(&ops, &img, target.as_mut(), progress, cancel)?;
         } else {
             // Verify through the same handle while the disk is still locked (reads bypass the
             // cache on every platform). The GPT is checked structurally rather than byte for
@@ -93,19 +104,34 @@ pub fn verify_only(image: &Path, source: &str, progress: &mut dyn FnMut(Progress
     let img = RkfwImage::open(image)?;
     let mut t = target::open_readable(source)?;
     let total_sectors = t.size() / 512;
-    // Check the data against the layout the card actually has, so a card that was upgraded (or
-    // whose table a host normalised) verifies as well as a freshly written one.
-    let plan = match read_existing_table(t.as_mut()).and_then(|e| plan::build_upgrade(&img, total_sectors, &e)) {
-        Ok(p) => p,
-        Err(_) => plan::build(&img, total_sectors)?,
+    // An update card is recognisable from sector 0: a real master boot record with a FAT
+    // partition, where a boot card has the protective entry of a GPT.
+    let mut mbr = vec![0u8; 512];
+    t.read_at(0, &mut mbr)?;
+    let is_update_card = mbr[0x1fe] == 0x55 && mbr[0x1ff] == 0xaa && mbr[0x1be + 4] != 0xee && mbr[0x1be + 4] != 0;
+    // Otherwise check the data against the layout the card actually has, so a card that was
+    // upgraded (or whose table a host normalised) verifies as well as a freshly written one.
+    let plan = if is_update_card {
+        plan::build_update_card(&img, total_sectors)?
+    } else {
+        match read_existing_table(t.as_mut()).and_then(|e| plan::build_upgrade(&img, total_sectors, &e)) {
+            Ok(p) => p,
+            Err(_) => plan::build(&img, total_sectors)?,
+        }
     };
     // The GPT holds random GUIDs, so compare its structure separately and skip its bytes.
-    let ops: Vec<plan::Op> = plan.flattened().into_iter().filter(|o| o.step != "GPT" && o.step != "Clear MBR").collect();
+    let ops: Vec<plan::Op> = plan
+        .flattened()
+        .into_iter()
+        .filter(|o| is_update_card || (o.step != "GPT" && o.step != "Clear MBR"))
+        .collect();
     writer::verify_target(&ops, &img, t.as_mut(), progress, cancel)?;
-    // Structural GPT check.
-    let mut head = vec![0u8; 34 * 512];
-    t.read_at(0, &mut head)?;
-    check_gpt(&plan, &head, t.as_mut())?;
+    if !is_update_card {
+        // Structural GPT check.
+        let mut head = vec![0u8; 34 * 512];
+        t.read_at(0, &mut head)?;
+        check_gpt(&plan, &head, t.as_mut())?;
+    }
     Ok(plan)
 }
 

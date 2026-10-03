@@ -63,8 +63,12 @@ enum Cmd {
         /// Upgrade a card that already has this layout: write the loader and the firmware
         /// partitions, keep the partition table, user data and the device's own state (misc,
         /// cache, metadata).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "update_card")]
         upgrade: bool,
+        /// Make a firmware update card instead of a boot card: the device boots from it into
+        /// recovery and flashes its own internal storage from the firmware carried on the card.
+        #[arg(long)]
+        update_card: bool,
         /// Do not ask for confirmation before writing to a device.
         #[arg(short, long)]
         yes: bool,
@@ -153,6 +157,10 @@ fn print_image(img: &RkfwImage) {
     let min = gpt::minimum_sectors(&img.parameter) * 512;
     println!();
     println!("Minimum card size: {} ({} bytes)", human_bytes(min), min);
+    match plan::minimum_sectors_update_card(img) {
+        Ok(sec) => println!("  as a firmware update card: {}", human_bytes(sec * 512)),
+        Err(e) => println!("  cannot be made into an update card: {e}"),
+    }
 }
 
 fn run_cmd(cmd: Cmd) -> Result<()> {
@@ -212,12 +220,22 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                 println!("no removable disks found{}", if all { "" } else { " (use --all to list every disk)" });
             }
         }
-        Cmd::Write { image, to, size, no_verify, no_block_verify, upgrade, yes, xz_level, progress_file } => {
+        Cmd::Write { image, to, size, no_verify, no_block_verify, upgrade, update_card, yes, xz_level, progress_file } => {
             let is_dev = disks::is_block_device_path(&to);
             let size_bytes = match &size {
                 Some(s) => Some(parse_size(s).ok_or_else(|| anyhow::anyhow!("bad size '{s}'"))?),
                 None => None,
             };
+            let mode = if upgrade {
+                rockchip_sd_tool::plan::Mode::Upgrade
+            } else if update_card {
+                rockchip_sd_tool::plan::Mode::UpdateCard
+            } else {
+                rockchip_sd_tool::plan::Mode::Full
+            };
+            if update_card && to.to_ascii_lowercase().ends_with(".xz") {
+                bail!("an update card cannot be written to a compressed image; use a card or a raw .img");
+            }
             if !is_dev && size_bytes.is_none() && !upgrade {
                 bail!("--size is required when writing to a file (the size of the SD card the image is for)");
             }
@@ -232,12 +250,15 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                     if !yes {
                         if upgrade {
                             eprintln!("About to UPGRADE {} ({}, {}) from {}: the firmware partitions are replaced; the partition table, user data and the device's own state (misc, cache, metadata) are kept.", d.path, d.model, human_bytes(d.size), image.display());
+                        } else if update_card {
+                            eprintln!("About to ERASE {} ({}, {}) and make a firmware update card from {}: the device will flash its own internal storage from it.", d.path, d.model, human_bytes(d.size), image.display());
                         } else {
                             eprintln!("About to ERASE {} ({}, {}) and write {}.", d.path, d.model, human_bytes(d.size), image.display());
                         }
                     }
                 } else if !yes {
-                    eprintln!("About to {} {} with {}.", if upgrade { "UPGRADE" } else { "ERASE" }, to, image.display());
+                    let verb = if upgrade { "UPGRADE" } else if update_card { "make an UPDATE CARD of" } else { "ERASE" };
+                    eprintln!("About to {} {} with {}.", verb, to, image.display());
                 }
                 if !yes {
                     eprint!("Type 'yes' to continue: ");
@@ -248,7 +269,7 @@ fn run_cmd(cmd: Cmd) -> Result<()> {
                     }
                 }
             }
-            let spec = JobSpec { image, output: to, size: size_bytes, verify: !no_verify, xz_level, verify_blocks: !no_block_verify, upgrade };
+            let spec = JobSpec { image, output: to, size: size_bytes, verify: !no_verify, xz_level, verify_blocks: !no_block_verify, mode };
             let cancel = Cancel::new();
             let mut pf = match &progress_file {
                 Some(p) => Some(std::fs::File::create(p).with_context(|| format!("cannot create {}", p.display()))?),

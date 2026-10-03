@@ -139,6 +139,70 @@ pub enum Mode {
     /// Write the loader and every partition the image carries onto a card that already has this
     /// layout, keeping its partition table and everything the image does not cover (userdata).
     Upgrade,
+    /// Make a firmware update card: the device boots from it into recovery and flashes its own
+    /// internal storage from a copy of the firmware carried in a FAT partition on the card.
+    UpdateCard,
+}
+
+/// Files an update card carries in its FAT partition, with the names the device looks for.
+pub const UPDATE_IMAGE_NAME: &str = "sdupdate.img";
+pub const UPDATE_CONFIG_NAME: &str = "sd_boot_config.config";
+pub const UPDATE_TAG_NAME: &str = "rksdfw.tag";
+/// Volume label of that partition.
+pub const UPDATE_VOLUME_LABEL: &str = "RKUPDATE";
+/// The partition the device's recovery is in, which is as far as an update card is written.
+pub const UPGRADE_PROGRAM_PARTITION: &str = "recovery";
+/// Where the legacy parameter copies go, and how many.
+pub const PARAM_SECTOR: u64 = 0x2000;
+pub const PARAM_COPIES: u64 = 8;
+pub const PARAM_STRIDE: u64 = 0x80000 / SECTOR;
+
+/// The boot command an update card leaves for the device: enter recovery and run the firmware
+/// update from the card, which is what Rockchip's tool writes in this mode.
+pub fn update_card_bcb() -> Vec<u8> {
+    let mut m = vec![0u8; BCB_OFFSET_ROCKCHIP + BCB_SIZE];
+    for off in [BCB_OFFSET_GOOGLE, BCB_OFFSET_ROCKCHIP] {
+        m[off..off + 13].copy_from_slice(b"boot-recovery");
+        m[off + 64..off + 64 + 23].copy_from_slice(b"recovery\n--rk_fwupdate\n");
+    }
+    m
+}
+
+/// The config the device's recovery reads off the card to decide what to do. `fw_update = 1`
+/// is what turns the card into a firmware update card.
+pub fn update_card_config() -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str("#rockchip sdcard boot config file for factory\n");
+    s.push_str("loader_update = 0\n");
+    s.push_str("display_led = 1\n");
+    s.push_str("display_lcd = 1\n");
+    s.push_str("pcba_test = 0\n");
+    s.push_str("fw_update = 1\n");
+    s.push_str("demo_copy = 0\n");
+    s.into_bytes()
+}
+
+/// A master boot record with a single FAT32 partition, so the device (and a PC) see the card's
+/// data area as an ordinary removable disk. The partition table the firmware itself uses is the
+/// GPT written just after it; that GPT is deliberately left without a protective MBR, so an
+/// operating system reads the MBR here and the bootloader reads the GPT.
+pub fn update_card_mbr(start_lba: u64, sectors: u64) -> Vec<u8> {
+    let mut mbr = vec![0u8; SECTOR as usize];
+    let e = 0x1be;
+    mbr[e] = 0x00; // not bootable
+    // Classic "maximum" CHS values; every modern reader uses the LBA fields below.
+    mbr[e + 1] = 0xfe;
+    mbr[e + 2] = 0xff;
+    mbr[e + 3] = 0xff;
+    mbr[e + 4] = 0x0b; // FAT32, the type Rockchip's tool writes
+    mbr[e + 5] = 0xfe;
+    mbr[e + 6] = 0xff;
+    mbr[e + 7] = 0xff;
+    mbr[e + 8..e + 12].copy_from_slice(&(start_lba as u32).to_le_bytes());
+    mbr[e + 12..e + 16].copy_from_slice(&(sectors.min(u32::MAX as u64) as u32).to_le_bytes());
+    mbr[0x1fe] = 0x55;
+    mbr[0x1ff] = 0xaa;
+    mbr
 }
 
 #[derive(Debug, Clone)]
@@ -262,18 +326,50 @@ pub fn check_layout(param: &crate::parameter::Parameter, existing: &[gpt::GptEnt
     Ok(())
 }
 
+/// Builds the plan for a firmware update card: the device boots from it into recovery and
+/// flashes its own internal storage from the copy of the firmware the card carries.
+pub fn build_update_card(img: &RkfwImage, total_sectors: u64) -> Result<Plan> {
+    build_with_mode(img, total_sectors, None, Mode::UpdateCard)
+}
+
 fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptEntry]>) -> Result<Plan> {
+    let mode = if existing.is_some() { Mode::Upgrade } else { Mode::Full };
+    build_with_mode(img, total_sectors, existing, mode)
+}
+
+fn build_with_mode(
+    img: &RkfwImage,
+    total_sectors: u64,
+    existing: Option<&[gpt::GptEntry]>,
+    mode: Mode,
+) -> Result<Plan> {
     if img.parameter.part_type != "GPT" {
         bail!(
             "the image's parameter file has TYPE: {} ; only GPT layouts are supported for SD boot cards",
             if img.parameter.part_type.is_empty() { "(none)" } else { &img.parameter.part_type }
         );
     }
-    let mode = if existing.is_some() { Mode::Upgrade } else { Mode::Full };
     let (gpt_img, entries) = match existing {
         Some(e) => {
             check_layout(&img.parameter, e)?;
             (None, e.to_vec())
+        }
+        None if mode == Mode::UpdateCard => {
+            // An update card's table covers only the firmware area. Everything past it is the
+            // data partition that carries the firmware file, described by a master boot record
+            // instead, so listing those partitions here would only overlap it.
+            let data_start = update_card_data_start(img)?;
+            let mut param = img.parameter.clone();
+            param.partitions.retain(|p| match p.size {
+                Some(sz) => p.offset + sz <= data_start,
+                None => false,
+            });
+            if !param.partitions.iter().any(|p| p.name.eq_ignore_ascii_case(UPGRADE_PROGRAM_PARTITION)) {
+                bail!("this image has no {UPGRADE_PROGRAM_PARTITION} partition, so it cannot make an update card");
+            }
+            let g = gpt::build(&param, total_sectors)?;
+            let entries = g.entries.clone();
+            (Some(g), entries)
         }
         None => {
             let g = gpt::build(&img.parameter, total_sectors)?;
@@ -285,7 +381,7 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
     let mut notes = Vec::new();
 
     // 1. Clear MBR: 1 KiB of zeros at sector 0. An upgrade keeps the table that is there.
-    if mode == Mode::Full {
+    if mode == Mode::Full || mode == Mode::UpdateCard {
         ops.push(Op { step: "Clear MBR".into(), sector: 0, sectors: 2, source: Source::Zero });
     } else {
         notes.push(
@@ -322,13 +418,58 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
         }
     }
 
+    // An update card is only written as far as the partition the device's recovery lives in:
+    // everything past it belongs to the data partition that carries the firmware file.
+    let update_limit = if mode == Mode::UpdateCard {
+        let e = entries
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(UPGRADE_PROGRAM_PARTITION))
+            .ok_or_else(|| anyhow::anyhow!(
+                "this image has no {UPGRADE_PROGRAM_PARTITION} partition, so it cannot make an update card"
+            ))?;
+        Some(e.last_lba + 1)
+    } else {
+        None
+    };
+
     // 3. Firmware items.
     for item in &img.af.items {
         if item.nand_addr == 0xffff_ffff || item.size == 0 || item.is_reserved() {
             continue;
         }
+        if let Some(limit) = update_limit {
+            if (item.nand_addr as u64) >= limit && !item.name.eq_ignore_ascii_case("parameter") {
+                notes.push(format!("{}: not written (an update card stops after {UPGRADE_PROGRAM_PARTITION})", item.name));
+                continue;
+            }
+        }
         if item.name.eq_ignore_ascii_case("parameter") {
+            if mode == Mode::UpdateCard {
+                // The legacy parameter block: eight copies, which is where a Rockchip bootloader
+                // looks for the layout when it is not reading a GPT.
+                let data = img.read_range(item.offset, item.size as usize)?;
+                let n = sectors_for(item.size);
+                for i in 0..PARAM_COPIES {
+                    ops.push(Op {
+                        step: "parameter".into(),
+                        sector: PARAM_SECTOR + i * PARAM_STRIDE,
+                        sectors: n,
+                        source: Source::Bytes(data.clone().into()),
+                    });
+                }
+                notes.push(format!("parameter: {PARAM_COPIES} copies from sector {PARAM_SECTOR}"));
+            }
             // GPT layouts get their table from the GPT step; the parameter item is not written.
+            continue;
+        }
+        if mode == Mode::UpdateCard && item.name.eq_ignore_ascii_case("misc") {
+            // Replace the image's misc with the command that sends the device into recovery to
+            // run the update from this card.
+            let mut data = update_card_bcb();
+            let n = sectors_for(data.len() as u64);
+            data.resize((n * SECTOR) as usize, 0);
+            ops.push(Op { step: "misc".into(), sector: item.nand_addr as u64, sectors: n, source: Source::Bytes(data.into()) });
+            notes.push("misc: boot-recovery with --rk_fwupdate, which starts the update".into());
             continue;
         }
         if mode == Mode::Upgrade && upgrade_keeps(&item.name) {
@@ -485,12 +626,113 @@ fn build_inner(img: &RkfwImage, total_sectors: u64, existing: Option<&[gpt::GptE
     }
 
     // 4. GPT: primary (34 sectors at 0), backup (33 sectors at total - 33).
-    if let Some(g) = &gpt_img {
+    if mode == Mode::UpdateCard {
+        // Only the header and the entries, starting at sector 1. Sector 0 is left for a real
+        // master boot record, so an operating system sees the FAT partition while the
+        // bootloader still finds the firmware partitions through the GPT.
+        let g = gpt_img.as_ref().expect("an update card builds its own table");
+        ops.push(Op { step: "GPT".into(), sector: 1, sectors: 33, source: Source::Bytes(g.primary[SECTOR as usize..].to_vec().into()) });
+        add_update_card_data(img, total_sectors, &mut ops, &mut notes)?;
+    } else if let Some(g) = &gpt_img {
         ops.push(Op { step: "GPT".into(), sector: 0, sectors: 34, source: Source::Bytes(g.primary.clone().into()) });
         ops.push(Op { step: "GPT".into(), sector: gpt::backup_sector(total_sectors), sectors: 33, source: Source::Bytes(g.backup.clone().into()) });
     }
 
     Ok(Plan { total_sectors, mode, ops, gpt: gpt_img, entries, notes })
+}
+
+/// Sectors left unused at the end of an update card, as Rockchip's tool leaves them.
+pub const UPDATE_CARD_TAIL: u64 = 0x800;
+/// Gap between the end of the recovery partition and the data partition, again as the tool does.
+pub const UPDATE_CARD_GAP: u64 = 0x2000;
+
+/// Where the data partition of an update card starts.
+pub fn update_card_data_start(img: &RkfwImage) -> Result<u64> {
+    let recovery = img
+        .parameter
+        .partition(UPGRADE_PROGRAM_PARTITION)
+        .ok_or_else(|| anyhow::anyhow!("this image has no {UPGRADE_PROGRAM_PARTITION} partition"))?;
+    let end = recovery.offset + recovery.size.unwrap_or(0);
+    Ok(end + UPDATE_CARD_GAP)
+}
+
+/// Smallest card an update card for this image fits on: everything written for the bootloader,
+/// then the firmware file itself in the FAT partition, plus the filesystem's own overhead.
+pub fn minimum_sectors_update_card(img: &RkfwImage) -> Result<u64> {
+    let start = update_card_data_start(img)?;
+    let payload = sectors_for(img.file_size);
+    // Reserved sectors, two tables and the root directory, plus a little slack for rounding the
+    // file up to whole clusters.
+    let overhead = 2048 + payload / 128 + 2048;
+    Ok(start + payload + overhead + UPDATE_CARD_TAIL)
+}
+
+/// Lays out the data partition of an update card: a master boot record, then a FAT32 filesystem
+/// holding the firmware image and the two files the device's recovery reads.
+fn add_update_card_data(
+    img: &RkfwImage,
+    total_sectors: u64,
+    ops: &mut Vec<Op>,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    // Placed where Rockchip's tool places it: four mebibytes past the end of the recovery
+    // partition, running to a mebibyte short of the end of the card.
+    let start = update_card_data_start(img)?;
+    let tail = UPDATE_CARD_TAIL;
+    if start + tail + 2048 >= total_sectors {
+        bail!(
+            "the card has no room for the firmware file: it needs more than {}",
+            crate::util::human_bytes((start + tail) * SECTOR)
+        );
+    }
+    let sectors = total_sectors - start - tail;
+
+    if img.file_size > crate::fat32::MAX_FILE {
+        bail!(
+            "the firmware is {} and a FAT32 filesystem cannot hold a file of 4 GiB or more, so this image cannot be put on an update card",
+            crate::util::human_bytes(img.file_size)
+        );
+    }
+
+    let config = update_card_config();
+    let files = vec![
+        crate::fat32::FatFile {
+            name: UPDATE_IMAGE_NAME.into(),
+            len: img.file_size,
+            source: Source::File { offset: 0, len: img.file_size },
+        },
+        crate::fat32::FatFile {
+            name: UPDATE_TAG_NAME.into(),
+            len: 0,
+            source: Source::Bytes(Vec::new().into()),
+        },
+        crate::fat32::FatFile {
+            name: UPDATE_CONFIG_NAME.into(),
+            len: config.len() as u64,
+            source: Source::Bytes(config.into()),
+        },
+    ];
+    // A volume id derived from the image keeps a rebuild of the same firmware identical.
+    let volume_id = crate::rkcrc::crc32_rk(img.path.to_string_lossy().as_bytes()) ^ (img.file_size as u32);
+    let (geom, mut pieces) = crate::fat32::build(sectors, UPDATE_VOLUME_LABEL, files, volume_id)?;
+    crate::fat32::set_hidden_sectors(&mut pieces, start);
+
+    ops.push(Op { step: "MBR".into(), sector: 0, sectors: 1, source: Source::Bytes(update_card_mbr(start, sectors).into()) });
+    for p in pieces {
+        let n = sectors_for(p.len);
+        ops.push(Op { step: "firmware file".into(), sector: start + p.offset / SECTOR, sectors: n, source: p.source });
+    }
+    ops.push(Op { step: "GPT".into(), sector: total_sectors - tail, sectors: tail, source: Source::Zero });
+
+    notes.push(format!(
+        "data partition: FAT32 at sector {start}, {} with {} clusters of {}, holding {} ({}), {UPDATE_CONFIG_NAME} and {UPDATE_TAG_NAME}",
+        crate::util::human_bytes(sectors * SECTOR),
+        geom.cluster_count,
+        crate::util::human_bytes(geom.cluster_bytes()),
+        UPDATE_IMAGE_NAME,
+        crate::util::human_bytes(img.file_size)
+    ));
+    Ok(())
 }
 
 /// The 2 KiB id block SDDiskTool writes for chips without an RKNS `FlashHead` entry. Sector 0
